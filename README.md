@@ -19,7 +19,7 @@ cargo add vad-burn
 
 ```toml
 [dependencies]
-vad-burn = "0.1.2"
+vad-burn = "0.1.3"
 ```
 
 ```rust
