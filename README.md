@@ -142,7 +142,7 @@ cargo run --release -p vad-burn --example bench_fsmn_vad -- \
 测试环境：
 
 - 模型：FSMN VAD `model.pt` + `am.mvn`
-- 后端：Burn Flex CPU
+- 后端：Burn Flex CPU, `rayon` + `apple-amx`
 - 设备：MacBook Pro, Apple M1, 8 核 CPU, 16 GB 内存
 - 音频：`assets/vad_example.wav`, 16kHz mono PCM, 70.47s
 - 构建：`--release`
@@ -168,5 +168,5 @@ FireRedVAD 测试结果：
 
 | 模式 | 平均耗时 | RTF | 加速比 |
 | --- | ---: | ---: | ---: |
-| 离线 VAD | 115.497 ms | 0.001639 | 610.15x |
-| Stream-VAD 600ms chunk | 177.874 ms | 0.002524 | 396.18x |
+| 离线 VAD | 84.939 ms | 0.001205 | 829.66x |
+| Stream-VAD 600ms chunk | 232.643 ms | 0.003301 | 302.91x |

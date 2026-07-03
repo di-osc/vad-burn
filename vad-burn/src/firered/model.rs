@@ -281,7 +281,7 @@ struct FireRedDfsmnBlock {
 
 struct FireRedFsmn {
     lookback_tensor: Tensor<Backend, 3>,
-    lookahead_tensor: Option<Tensor<Backend, 3>>,
+    memory_tensor: Option<Tensor<Backend, 3>>,
     lookback_weight: Vec<f32>,
 }
 
@@ -442,11 +442,18 @@ impl FireRedFsmn {
     fn load(reader: &PytorchReader, device: &FlexDevice, prefix: &str) -> Result<Self> {
         let lookback_key = format!("{prefix}.lookback_filter.weight");
         let lookahead_key = format!("{prefix}.lookahead_filter.weight");
-        let (lookback_tensor, lookback_weight) = load_fsmn_weight(reader, device, &lookback_key)?;
-        let lookahead_tensor = load_optional_fsmn_weight(reader, device, &lookahead_key)?;
+        let lookback_raw = load_fsmn_raw(reader, &lookback_key)?;
+        let lookback_tensor = fsmn_tensor(lookback_raw.clone(), device);
+        let lookback_weight = transpose_fsmn_weight(&lookback_raw);
+        let memory_tensor = if reader.get(&lookahead_key).is_some() {
+            let lookahead_raw = load_fsmn_raw(reader, &lookahead_key)?;
+            Some(combined_fsmn_tensor(&lookback_raw, &lookahead_raw, device))
+        } else {
+            None
+        };
         Ok(Self {
             lookback_tensor,
-            lookahead_tensor,
+            memory_tensor,
             lookback_weight,
         })
     }
@@ -455,6 +462,21 @@ impl FireRedFsmn {
         let [frames, proj_dim] = input.dims();
         if proj_dim != PROJ_DIM {
             bail!("unexpected FireRed FSMN input shape: {:?}", input.dims());
+        }
+        if frames > 1
+            && let Some(memory_tensor) = &self.memory_tensor
+        {
+            let x = input.swap_dims(0, 1).reshape([1, PROJ_DIM, frames]);
+            let memory = conv1d(
+                x,
+                memory_tensor.clone(),
+                None,
+                ConvOptions::new([1], [FSMN_ORDER * 2 - 1], [1], PROJ_DIM),
+            )
+            .slice([0..1, 0..PROJ_DIM, FSMN_ORDER..FSMN_ORDER + frames])
+            .reshape([PROJ_DIM, frames])
+            .swap_dims(0, 1);
+            return Ok(memory);
         }
         let x = input.clone().swap_dims(0, 1).reshape([1, PROJ_DIM, frames]);
         let lookback = conv1d(
@@ -467,22 +489,7 @@ impl FireRedFsmn {
             .slice([0..1, 0..PROJ_DIM, 0..frames])
             .reshape([PROJ_DIM, frames])
             .swap_dims(0, 1);
-        let mut memory = input + lookback;
-        if frames > 1
-            && let Some(lookahead_tensor) = &self.lookahead_tensor
-        {
-            let lookahead = conv1d(
-                x,
-                lookahead_tensor.clone(),
-                None,
-                ConvOptions::new([1], [FSMN_ORDER], [1], PROJ_DIM),
-            )
-            .slice([0..1, 0..PROJ_DIM, FSMN_ORDER + 1..FSMN_ORDER + 1 + frames])
-            .reshape([PROJ_DIM, frames])
-            .swap_dims(0, 1);
-            memory = memory + lookahead;
-        }
-        Ok(memory)
+        Ok(input + lookback)
     }
 
     fn forward_streaming(
@@ -1258,38 +1265,47 @@ fn load_vec(reader: &PytorchReader, key: &str) -> Result<Vec<f32>> {
     Ok(snapshot.to_data()?.convert::<f32>().into_vec::<f32>()?)
 }
 
-fn load_fsmn_weight(
-    reader: &PytorchReader,
-    device: &FlexDevice,
-    key: &str,
-) -> Result<(Tensor<Backend, 3>, Vec<f32>)> {
+fn load_fsmn_raw(reader: &PytorchReader, key: &str) -> Result<Vec<f32>> {
     let shape = tensor_shape(reader, key)?;
     if shape != [PROJ_DIM, 1, FSMN_ORDER] {
         bail!("{key} must have shape [{PROJ_DIM}, 1, {FSMN_ORDER}], got {shape:?}");
     }
-    let raw = load_vec(reader, key)?;
+    load_vec(reader, key)
+}
+
+fn fsmn_tensor(raw: Vec<f32>, device: &FlexDevice) -> Tensor<Backend, 3> {
+    Tensor::<Backend, 3>::from_data(TensorData::new(raw, [PROJ_DIM, 1, FSMN_ORDER]), device)
+}
+
+fn combined_fsmn_tensor(
+    lookback: &[f32],
+    lookahead: &[f32],
+    device: &FlexDevice,
+) -> Tensor<Backend, 3> {
+    let mut combined = vec![0.0; PROJ_DIM * FSMN_ORDER * 2];
+    for channel in 0..PROJ_DIM {
+        let lookback_base = channel * FSMN_ORDER;
+        let combined_base = channel * FSMN_ORDER * 2;
+        combined[combined_base..combined_base + FSMN_ORDER]
+            .copy_from_slice(&lookback[lookback_base..lookback_base + FSMN_ORDER]);
+        combined[combined_base + FSMN_ORDER - 1] += 1.0;
+        combined[combined_base + FSMN_ORDER..combined_base + FSMN_ORDER * 2]
+            .copy_from_slice(&lookahead[lookback_base..lookback_base + FSMN_ORDER]);
+    }
+    Tensor::<Backend, 3>::from_data(
+        TensorData::new(combined, [PROJ_DIM, 1, FSMN_ORDER * 2]),
+        device,
+    )
+}
+
+fn transpose_fsmn_weight(raw: &[f32]) -> Vec<f32> {
     let mut transposed = vec![0.0; raw.len()];
     for channel in 0..PROJ_DIM {
         for kernel in 0..FSMN_ORDER {
             transposed[kernel * PROJ_DIM + channel] = raw[channel * FSMN_ORDER + kernel];
         }
     }
-    Ok((
-        Tensor::<Backend, 3>::from_data(TensorData::new(raw, [PROJ_DIM, 1, FSMN_ORDER]), device),
-        transposed,
-    ))
-}
-
-fn load_optional_fsmn_weight(
-    reader: &PytorchReader,
-    device: &FlexDevice,
-    key: &str,
-) -> Result<Option<Tensor<Backend, 3>>> {
-    if reader.get(key).is_none() {
-        return Ok(None);
-    }
-    let (tensor, _) = load_fsmn_weight(reader, device, key)?;
-    Ok(Some(tensor))
+    transposed
 }
 
 fn read_kaldi_binary_cmvn(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
