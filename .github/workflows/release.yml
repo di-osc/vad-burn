@@ -58,7 +58,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            manylinux: "--manylinux 2014"
+            manylinux: "2014"
           - os: macos-latest
             manylinux: ""
           - os: windows-latest
@@ -70,7 +70,8 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --features extension-module --out dist ${{ matrix.manylinux }}
+          args: --release --features extension-module --out dist
+          manylinux: ${{ matrix.manylinux }}
           sccache: true
       - uses: actions/upload-artifact@v4
         with:
