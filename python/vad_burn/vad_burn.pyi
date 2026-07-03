@@ -1,3 +1,9 @@
+"""Type stubs for vad_burn.
+
+Audio inputs are mono, normalized float PCM samples at 16 kHz unless a method
+explicitly says otherwise.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Sequence
@@ -5,22 +11,22 @@ from typing import Optional
 
 
 class VadOptions:
-    """VAD segmentation options."""
+    """Segmentation options used by both offline and streaming VAD."""
 
     threshold: float
-    """Speech/noise posterior threshold."""
+    """Speech threshold used by the FSMN VAD post-processor."""
 
     min_speech_ms: int
-    """Drop detected speech shorter than this duration."""
+    """Drop speech segments shorter than this duration, in milliseconds."""
 
     min_silence_ms: int
-    """Silence duration used to close a speech segment."""
+    """Silence duration required to close a speech segment, in milliseconds."""
 
     max_segment_ms: int
-    """Maximum segment duration. Use 0 to disable long-segment splitting."""
+    """Maximum speech segment duration in milliseconds. Use 0 to disable splitting."""
 
     pad_ms: int
-    """Reserved segment padding in milliseconds."""
+    """Reserved padding value in milliseconds; currently kept for API compatibility."""
 
     def __init__(
         self,
@@ -42,20 +48,20 @@ class VadSegment:
     """Segment end time in milliseconds."""
 
     probability: float
-    """Segment confidence or threshold value."""
+    """Segment score reported by the post-processor."""
 
 
 class VadTiming:
     """Timing breakdown for a timed VAD run."""
 
     frontend_seconds: float
-    """Feature extraction time."""
+    """Feature extraction time in seconds."""
 
     forward_seconds: float
-    """FSMN forward time."""
+    """FSMN forward pass time in seconds."""
 
     segmenter_seconds: float
-    """Post-processing time."""
+    """Segmentation post-processing time in seconds."""
 
 
 class VadDetection:
@@ -65,7 +71,7 @@ class VadDetection:
     """Detected speech segments."""
 
     frame_scores: list[list[float]]
-    """Per-frame silence posterior scores."""
+    """Per-frame posterior scores produced by the model."""
 
     timing: VadTiming
     """Timing breakdown."""
@@ -75,11 +81,16 @@ class FsmnVadStream:
     """Stateful streaming FSMN VAD session."""
 
     def push(self, samples: Sequence[float], sample_rate: int) -> list[VadSegment]:
-        """Push one audio chunk and return newly finalized speech segments."""
+        """Push one mono 16 kHz audio chunk and return newly finalized segments.
+
+        Samples must be normalized float PCM values, usually in the range
+        [-1.0, 1.0]. Call finish() once after the final chunk to flush any
+        pending speech segment.
+        """
         ...
 
     def finish(self) -> list[VadSegment]:
-        """Finalize the stream and return remaining speech segments."""
+        """Flush the final pending chunk, return remaining segments, and reset state."""
         ...
 
     def reset(self) -> None:
@@ -104,10 +115,10 @@ class FsmnVadModel:
         repo_id: Optional[str] = None,
         revision: Optional[str] = None,
     ) -> FsmnVadModel:
-        """Download from ModelScope cache and load the FSMN VAD model.
+        """Download through ModelScope cache and load the FSMN VAD model.
 
         Defaults to repo_id "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
-        and revision "master".
+        and revision "master". Existing cached files are reused automatically.
         """
         ...
 
@@ -117,7 +128,10 @@ class FsmnVadModel:
         sample_rate: int,
         options: Optional[VadOptions] = None,
     ) -> list[VadSegment]:
-        """Run offline VAD on normalized float PCM samples."""
+        """Run offline VAD on mono normalized float PCM samples.
+
+        sample_rate must be 16000.
+        """
         ...
 
     def detect_with_timing(
@@ -126,9 +140,9 @@ class FsmnVadModel:
         sample_rate: int,
         options: Optional[VadOptions] = None,
     ) -> VadDetection:
-        """Run offline VAD and return segments, frame scores, and timing."""
+        """Run offline VAD and return segments, model frame scores, and timing."""
         ...
 
     def new_stream(self, options: Optional[VadOptions] = None) -> FsmnVadStream:
-        """Create a stateful streaming VAD session."""
+        """Create a stateful streaming VAD session from this loaded model."""
         ...
