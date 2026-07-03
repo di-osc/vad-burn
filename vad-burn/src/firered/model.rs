@@ -48,8 +48,11 @@ pub struct FireRedVadDetection {
 }
 
 pub struct FireRedVadModel {
-    weights: Arc<FireRedVadWeights>,
+    offline_weights: Arc<FireRedVadWeights>,
+    stream_weights: Arc<FireRedVadWeights>,
     model_dir: PathBuf,
+    offline_model_dir: PathBuf,
+    stream_model_dir: PathBuf,
 }
 
 pub struct FireRedVadStream {
@@ -64,9 +67,16 @@ pub struct FireRedVadStream {
 impl FireRedVadModel {
     pub fn from_pretrained(model_dir: impl AsRef<Path>) -> Result<Self> {
         let model_dir = model_dir.as_ref().to_path_buf();
-        validate_model_dir(&model_dir)?;
-        let weights = Arc::new(FireRedVadWeights::load(&model_dir)?);
-        Ok(Self { weights, model_dir })
+        let model_dirs = FireRedModelDirs::from_path(&model_dir)?;
+        let offline_weights = Arc::new(FireRedVadWeights::load(&model_dirs.offline)?);
+        let stream_weights = Arc::new(FireRedVadWeights::load(&model_dirs.stream)?);
+        Ok(Self {
+            offline_weights,
+            stream_weights,
+            model_dir,
+            offline_model_dir: model_dirs.offline,
+            stream_model_dir: model_dirs.stream,
+        })
     }
 
     pub fn from_modelscope() -> Result<Self> {
@@ -81,30 +91,8 @@ impl FireRedVadModel {
         runtime.block_on(Self::from_modelscope_revision_async(repo_id, revision))
     }
 
-    pub fn from_modelscope_stream() -> Result<Self> {
-        Self::from_modelscope_stream_revision(
-            DEFAULT_FIRERED_MODELSCOPE_REPO_ID,
-            DEFAULT_FIRERED_MODELSCOPE_REVISION,
-        )
-    }
-
-    pub fn from_modelscope_stream_revision(repo_id: &str, revision: &str) -> Result<Self> {
-        let runtime = tokio::runtime::Runtime::new()?;
-        runtime.block_on(Self::from_modelscope_stream_revision_async(
-            repo_id, revision,
-        ))
-    }
-
     pub async fn from_modelscope_async() -> Result<Self> {
         Self::from_modelscope_revision_async(
-            DEFAULT_FIRERED_MODELSCOPE_REPO_ID,
-            DEFAULT_FIRERED_MODELSCOPE_REVISION,
-        )
-        .await
-    }
-
-    pub async fn from_modelscope_stream_async() -> Result<Self> {
-        Self::from_modelscope_stream_revision_async(
             DEFAULT_FIRERED_MODELSCOPE_REPO_ID,
             DEFAULT_FIRERED_MODELSCOPE_REVISION,
         )
@@ -114,29 +102,26 @@ impl FireRedVadModel {
     pub async fn from_modelscope_revision_async(repo_id: &str, revision: &str) -> Result<Self> {
         let cache_dir = modelhub::modelscope::cache_dir();
         modelhub::modelscope::download_model_revision(repo_id, revision, &cache_dir).await?;
-        Self::from_pretrained(modelscope_snapshot_dir(&cache_dir, repo_id, revision).join("VAD"))
-    }
-
-    pub async fn from_modelscope_stream_revision_async(
-        repo_id: &str,
-        revision: &str,
-    ) -> Result<Self> {
-        let cache_dir = modelhub::modelscope::cache_dir();
-        modelhub::modelscope::download_model_revision(repo_id, revision, &cache_dir).await?;
-        Self::from_pretrained(
-            modelscope_snapshot_dir(&cache_dir, repo_id, revision).join("Stream-VAD"),
-        )
+        Self::from_pretrained(modelscope_snapshot_dir(&cache_dir, repo_id, revision))
     }
 
     pub fn model_dir(&self) -> &Path {
         &self.model_dir
     }
 
+    pub fn offline_model_dir(&self) -> &Path {
+        &self.offline_model_dir
+    }
+
+    pub fn stream_model_dir(&self) -> &Path {
+        &self.stream_model_dir
+    }
+
     pub fn new_stream(&self, options: VadOptions) -> FireRedVadStream {
         FireRedVadStream {
-            feature_stream: self.weights.frontend.new_stream(),
-            weights: Arc::clone(&self.weights),
-            caches: self.weights.zero_caches(),
+            feature_stream: self.stream_weights.frontend.new_stream(),
+            weights: Arc::clone(&self.stream_weights),
+            caches: self.stream_weights.zero_caches(),
             postprocessor: FireRedStreamVadPostprocessor::from_options(&options),
             options,
             frame_scores: Vec::new(),
@@ -156,7 +141,7 @@ impl FireRedVadModel {
 
         let mut timing = FireRedVadTiming::default();
         let frontend_start = Instant::now();
-        let feats = self.weights.frontend.extract(&waveform.samples)?;
+        let feats = self.offline_weights.frontend.extract(&waveform.samples)?;
         timing.frontend_seconds = frontend_start.elapsed().as_secs_f64();
         let [frames, feat_dim] = feats.dims();
         timing.frames = frames;
@@ -172,7 +157,7 @@ impl FireRedVadModel {
         }
 
         let forward_start = Instant::now();
-        let probs = self.weights.forward_probs(feats)?;
+        let probs = self.offline_weights.forward_probs(feats)?;
         timing.forward_seconds = forward_start.elapsed().as_secs_f64();
 
         let post_start = Instant::now();
@@ -251,6 +236,29 @@ struct FireRedVadWeights {
     blocks: Vec<FireRedDfsmnBlock>,
     dnn: BurnLinear,
     out: BurnLinear,
+}
+
+struct FireRedModelDirs {
+    offline: PathBuf,
+    stream: PathBuf,
+}
+
+impl FireRedModelDirs {
+    fn from_path(model_dir: &Path) -> Result<Self> {
+        if model_dir.join("VAD").is_dir() || model_dir.join("Stream-VAD").is_dir() {
+            let offline = model_dir.join("VAD");
+            let stream = model_dir.join("Stream-VAD");
+            validate_model_dir(&offline)?;
+            validate_model_dir(&stream)?;
+            return Ok(Self { offline, stream });
+        }
+
+        validate_model_dir(model_dir)?;
+        Ok(Self {
+            offline: model_dir.to_path_buf(),
+            stream: model_dir.to_path_buf(),
+        })
+    }
 }
 
 struct FireRedDfsmnBlock {

@@ -13,7 +13,7 @@ fn main() -> Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(600);
     let waveform = load_pcm16_wav(&audio)?;
-    let model = FireRedVadModel::from_modelscope_stream()?;
+    let model = FireRedVadModel::from_modelscope()?;
     let mut stream = model.new_stream(VadOptions::default());
     let chunk_samples = (waveform.sample_rate as u64 * chunk_ms / 1000) as usize;
     let mut segments = Vec::new();
@@ -25,7 +25,7 @@ fn main() -> Result<()> {
     println!(
         "firered_stream_vad audio={} model={} chunk_ms={} frames={} segments={}",
         audio.display(),
-        model.model_dir().display(),
+        model.stream_model_dir().display(),
         chunk_ms,
         frames,
         segments.len(),

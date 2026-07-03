@@ -381,25 +381,6 @@ impl PyFireRedVadModel {
         Ok(Self { inner })
     }
 
-    #[staticmethod]
-    #[pyo3(signature = (repo_id=None, revision=None))]
-    fn from_modelscope_stream(
-        py: Python<'_>,
-        repo_id: Option<&str>,
-        revision: Option<&str>,
-    ) -> PyResult<Self> {
-        let repo_id = repo_id
-            .unwrap_or(crate::DEFAULT_FIRERED_MODELSCOPE_REPO_ID)
-            .to_owned();
-        let revision = revision
-            .unwrap_or(crate::DEFAULT_FIRERED_MODELSCOPE_REVISION)
-            .to_owned();
-        let inner = py.allow_threads(move || {
-            FireRedVadModel::from_modelscope_stream_revision(&repo_id, &revision)
-        })?;
-        Ok(Self { inner })
-    }
-
     #[pyo3(signature = (samples, sample_rate, options=None))]
     fn detect(
         &self,

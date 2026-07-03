@@ -242,8 +242,8 @@ class FireRedVadStream:
         """Push one mono 16 kHz audio chunk and return newly finalized segments.
 
         Samples must be normalized float PCM values, usually in the range
-        [-1.0, 1.0]. FireRedVAD streaming should be created from the official
-        Stream-VAD model, for example FireRedVadModel.from_modelscope_stream().
+        [-1.0, 1.0]. FireRedVadModel.from_modelscope() loads both official
+        VAD and Stream-VAD weights; streams use the Stream-VAD weights.
         """
         ...
 
@@ -264,18 +264,29 @@ class FireRedVadModel:
     """FireRedVAD model implemented with Burn Flex.
 
     The loaded model can be shared across threads for concurrent offline
-    detect() calls and for creating independent streaming sessions. For
-    streaming, load the official Stream-VAD model with from_modelscope_stream()
-    or pass a local Stream-VAD directory to from_pretrained().
+    detect() calls and for creating independent streaming sessions.
+    from_modelscope() loads both official VAD and Stream-VAD weights. When
+    loading from disk, pass the official repository root containing VAD/ and
+    Stream-VAD/ to make detect() and new_stream() use their matching weights.
     """
 
     def __init__(self, model_dir: str) -> None:
-        """Load a local FireRedVAD VAD directory containing model.pth.tar and cmvn.ark."""
+        """Load FireRedVAD from a local model directory.
+
+        Prefer the official repository root containing VAD/ and Stream-VAD/.
+        A single directory containing model.pth.tar and cmvn.ark is accepted
+        for compatibility and is used for both offline and streaming paths.
+        """
         ...
 
     @staticmethod
     def from_pretrained(model_dir: str) -> FireRedVadModel:
-        """Load a local FireRedVAD VAD directory containing model.pth.tar and cmvn.ark."""
+        """Load FireRedVAD from a local model directory.
+
+        Prefer the official repository root containing VAD/ and Stream-VAD/.
+        A single directory containing model.pth.tar and cmvn.ark is accepted
+        for compatibility and is used for both offline and streaming paths.
+        """
         ...
 
     @staticmethod
@@ -286,19 +297,8 @@ class FireRedVadModel:
         """Download through ModelScope cache and load FireRedVAD.
 
         Defaults to repo_id "xukaituo/FireRedVAD" and revision "master".
-        The model files are loaded from the VAD subdirectory.
-        """
-        ...
-
-    @staticmethod
-    def from_modelscope_stream(
-        repo_id: Optional[str] = None,
-        revision: Optional[str] = None,
-    ) -> FireRedVadModel:
-        """Download through ModelScope cache and load FireRedVAD Stream-VAD.
-
-        Defaults to repo_id "xukaituo/FireRedVAD" and revision "master".
-        The model files are loaded from the Stream-VAD subdirectory.
+        Both VAD and Stream-VAD subdirectories are loaded into one model
+        object. detect() uses VAD; new_stream() uses Stream-VAD.
         """
         ...
 
@@ -330,9 +330,9 @@ class FireRedVadModel:
     def new_stream(self, options: Optional[VadOptions] = None) -> FireRedVadStream:
         """Create a stateful streaming FireRedVAD session from this loaded model.
 
-        Use FireRedVadModel.from_modelscope_stream() or a local Stream-VAD
-        directory for official streaming weights. Use one stream per audio
-        stream when running multiple streams in parallel.
+        The stream uses the Stream-VAD weights when the model was loaded from
+        ModelScope or from an official local repository root. Use one stream
+        per audio stream when running multiple streams in parallel.
         """
         ...
 

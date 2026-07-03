@@ -60,19 +60,19 @@ let waveform = Waveform::new(samples, 16_000);
 let segments = model.detect(&waveform, &VadOptions::default())?;
 ```
 
-FireRedVAD 流式推理使用官方 `Stream-VAD` 模型：
+FireRedVAD 使用同一个模型对象。`from_modelscope()` 会同时加载官方 `VAD` 和 `Stream-VAD` 权重，`detect` 走离线模型，`new_stream` 走流式模型：
 
 ```rust
 use vad_burn::{FireRedVadModel, VadOptions};
 
-let model = FireRedVadModel::from_modelscope_stream()?;
+let model = FireRedVadModel::from_modelscope()?;
 let mut stream = model.new_stream(VadOptions::default());
 
 for chunk in chunks {
     let segments = stream.push(chunk, 16_000)?;
 }
 
-let final_segments = stream.finish();
+let final_segments = stream.finish()?;
 ```
 
 ## Python 用法
@@ -111,12 +111,12 @@ vad = FireRedVadModel.from_modelscope()
 segments = vad.detect(samples, 16000, VadOptions())
 ```
 
-FireRedVAD 流式推理：
+FireRedVAD 流式推理使用同一个模型对象：
 
 ```python
 from vad_burn import FireRedVadModel, VadOptions
 
-vad = FireRedVadModel.from_modelscope_stream()
+vad = FireRedVadModel.from_modelscope()
 stream = vad.new_stream(VadOptions())
 
 for chunk in chunks:
