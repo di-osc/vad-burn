@@ -37,6 +37,10 @@ class VadOptions:
         pad_ms: int = 0,
     ) -> None: ...
 
+    def __repr__(self) -> str: ...
+
+    def __str__(self) -> str: ...
+
 
 class VadSegment:
     """Detected speech segment."""
@@ -49,6 +53,10 @@ class VadSegment:
 
     probability: float
     """Segment score reported by the post-processor."""
+
+    def __repr__(self) -> str: ...
+
+    def __str__(self) -> str: ...
 
 
 class VadTiming:
@@ -63,6 +71,10 @@ class VadTiming:
     segmenter_seconds: float
     """Segmentation post-processing time in seconds."""
 
+    def __repr__(self) -> str: ...
+
+    def __str__(self) -> str: ...
+
 
 class VadDetection:
     """Timed VAD detection result."""
@@ -75,6 +87,10 @@ class VadDetection:
 
     timing: VadTiming
     """Timing breakdown."""
+
+    def __repr__(self) -> str: ...
+
+    def __str__(self) -> str: ...
 
 
 class FireRedVadTiming:
@@ -92,6 +108,10 @@ class FireRedVadTiming:
     frames: int
     """Number of acoustic frames processed."""
 
+    def __repr__(self) -> str: ...
+
+    def __str__(self) -> str: ...
+
 
 class FireRedVadDetection:
     """Timed FireRedVAD detection result."""
@@ -104,6 +124,10 @@ class FireRedVadDetection:
 
     timing: FireRedVadTiming
     """Timing breakdown."""
+
+    def __repr__(self) -> str: ...
+
+    def __str__(self) -> str: ...
 
 
 class FsmnVadStream:
@@ -125,6 +149,10 @@ class FsmnVadStream:
     def reset(self) -> None:
         """Clear stream state and cached frames."""
         ...
+
+    def __repr__(self) -> str: ...
+
+    def __str__(self) -> str: ...
 
 
 class FsmnVadModel:
@@ -176,6 +204,10 @@ class FsmnVadModel:
         """Create a stateful streaming VAD session from this loaded model."""
         ...
 
+    def __repr__(self) -> str: ...
+
+    def __str__(self) -> str: ...
+
 
 class FireRedVadModel:
     """FireRedVAD model implemented with Burn Flex."""
@@ -221,3 +253,7 @@ class FireRedVadModel:
     ) -> FireRedVadDetection:
         """Run offline FireRedVAD and return segments, frame scores, and timing."""
         ...
+
+    def __repr__(self) -> str: ...
+
+    def __str__(self) -> str: ...

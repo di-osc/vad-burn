@@ -39,6 +39,21 @@ impl PyVadOptions {
             pad_ms,
         }
     }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "VadOptions(threshold={:.3}, min_speech_ms={}, min_silence_ms={}, max_segment_ms={}, pad_ms={})",
+            self.threshold,
+            self.min_speech_ms,
+            self.min_silence_ms,
+            self.max_segment_ms,
+            self.pad_ms
+        )
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
+    }
 }
 
 impl From<&PyVadOptions> for VadOptions {
@@ -74,6 +89,20 @@ impl From<VadSegment> for PyVadSegment {
     }
 }
 
+#[pymethods]
+impl PyVadSegment {
+    fn __repr__(&self) -> String {
+        format!(
+            "VadSegment(start_ms={}, end_ms={}, probability={:.3})",
+            self.start_ms, self.end_ms, self.probability
+        )
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
+    }
+}
+
 #[pyclass(name = "VadTiming")]
 #[derive(Debug, Clone)]
 pub struct PyVadTiming {
@@ -95,6 +124,20 @@ impl From<FsmnVadTiming> for PyVadTiming {
     }
 }
 
+#[pymethods]
+impl PyVadTiming {
+    fn __repr__(&self) -> String {
+        format!(
+            "VadTiming(frontend_seconds={:.6}, forward_seconds={:.6}, segmenter_seconds={:.6})",
+            self.frontend_seconds, self.forward_seconds, self.segmenter_seconds
+        )
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
+    }
+}
+
 #[pyclass(name = "VadDetection")]
 #[derive(Debug, Clone)]
 pub struct PyVadDetection {
@@ -113,6 +156,22 @@ impl From<FsmnVadDetection> for PyVadDetection {
             frame_scores: detection.frame_scores,
             timing: detection.timing.into(),
         }
+    }
+}
+
+#[pymethods]
+impl PyVadDetection {
+    fn __repr__(&self) -> String {
+        format!(
+            "VadDetection(segments={}, frame_scores={}, timing={})",
+            self.segments.len(),
+            self.frame_scores.len(),
+            self.timing.__repr__()
+        )
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
     }
 }
 
@@ -140,6 +199,20 @@ impl From<FireRedVadTiming> for PyFireRedVadTiming {
     }
 }
 
+#[pymethods]
+impl PyFireRedVadTiming {
+    fn __repr__(&self) -> String {
+        format!(
+            "FireRedVadTiming(frontend_seconds={:.6}, forward_seconds={:.6}, postprocess_seconds={:.6}, frames={})",
+            self.frontend_seconds, self.forward_seconds, self.postprocess_seconds, self.frames
+        )
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
+    }
+}
+
 #[pyclass(name = "FireRedVadDetection")]
 #[derive(Debug, Clone)]
 pub struct PyFireRedVadDetection {
@@ -158,6 +231,22 @@ impl From<FireRedVadDetection> for PyFireRedVadDetection {
             frame_scores: detection.frame_scores,
             timing: detection.timing.into(),
         }
+    }
+}
+
+#[pymethods]
+impl PyFireRedVadDetection {
+    fn __repr__(&self) -> String {
+        format!(
+            "FireRedVadDetection(segments={}, frame_scores={}, timing={})",
+            self.segments.len(),
+            self.frame_scores.len(),
+            self.timing.__repr__()
+        )
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
     }
 }
 
@@ -208,6 +297,7 @@ impl PyFsmnVadModel {
         Ok(Self { inner })
     }
 
+    #[pyo3(signature = (samples, sample_rate, options=None))]
     fn detect(
         &self,
         py: Python<'_>,
@@ -221,6 +311,7 @@ impl PyFsmnVadModel {
         Ok(segments.into_iter().map(Into::into).collect())
     }
 
+    #[pyo3(signature = (samples, sample_rate, options=None))]
     fn detect_with_timing(
         &self,
         py: Python<'_>,
@@ -235,11 +326,20 @@ impl PyFsmnVadModel {
             .into())
     }
 
+    #[pyo3(signature = (options=None))]
     fn new_stream(&self, options: Option<&PyVadOptions>) -> PyFsmnVadStream {
         let options = options.map_or_else(VadOptions::default, Into::into);
         PyFsmnVadStream {
             inner: self.inner.new_stream(options),
         }
+    }
+
+    fn __repr__(&self) -> String {
+        "FsmnVadModel()".to_owned()
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
     }
 }
 
@@ -276,6 +376,7 @@ impl PyFireRedVadModel {
         Ok(Self { inner })
     }
 
+    #[pyo3(signature = (samples, sample_rate, options=None))]
     fn detect(
         &self,
         py: Python<'_>,
@@ -289,6 +390,7 @@ impl PyFireRedVadModel {
         Ok(segments.into_iter().map(Into::into).collect())
     }
 
+    #[pyo3(signature = (samples, sample_rate, options=None))]
     fn detect_with_timing(
         &self,
         py: Python<'_>,
@@ -301,6 +403,14 @@ impl PyFireRedVadModel {
         Ok(py
             .allow_threads(|| self.inner.detect_with_timing(&waveform, &options))?
             .into())
+    }
+
+    fn __repr__(&self) -> String {
+        "FireRedVadModel()".to_owned()
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
     }
 }
 
@@ -321,6 +431,14 @@ impl PyFsmnVadStream {
 
     fn reset(&mut self) {
         self.inner.reset();
+    }
+
+    fn __repr__(&self) -> String {
+        "FsmnVadStream()".to_owned()
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
     }
 }
 
