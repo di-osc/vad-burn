@@ -12,9 +12,15 @@
 
 ## Rust 用法
 
+```bash
+cargo add vad-burn
+```
+
+如果手动编辑 `Cargo.toml`：
+
 ```toml
 [dependencies]
-vad-burn = "0.1"
+vad-burn = "0.1.2"
 ```
 
 ```rust
