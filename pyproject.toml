@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "vad-burn"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+]
+dynamic = ["version"]
+
+[tool.maturin]
+manifest-path = "vad-burn/Cargo.toml"
+features = ["extension-module"]
+module-name = "vad_burn.vad_burn"
+python-source = "python"

@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, for example v0.1.0"
+        required: true
+        type: string
+      publish:
+        description: "Publish wheels to PyPI"
+        required: true
+        default: false
+        type: boolean
+      publish_crates:
+        description: "Publish Rust crates to crates.io"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  prepare-release:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create tag if needed
+        id: tag
+        shell: bash
+        run: |
+          tag="${{ inputs.tag }}"
+          git fetch --tags origin
+          if ! git rev-parse "$tag" >/dev/null 2>&1; then
+            git tag "$tag"
+            git push origin "$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build-wheels:
+    name: Wheels ${{ matrix.os }}
+    needs: prepare-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --features extension-module --out dist
+          sccache: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist/*
+
+  github-release:
+    name: GitHub Release
+    needs: [prepare-release, build-wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare-release.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+
+  publish-pypi:
+    name: Publish PyPI
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: github-release
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+
+  publish-crates:
+    name: Publish crates.io
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_crates
+    needs: github-release
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish vad-data
+        run: cargo publish -p vad-data
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish vad-burn
+        shell: bash
+        run: |
+          for attempt in {1..10}; do
+            if cargo publish -p vad-burn; then
+              exit 0
+            fi
+            echo "vad-burn publish failed, waiting for crates.io index update ($attempt/10)"
+            sleep 30
+          done
+          exit 1
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
