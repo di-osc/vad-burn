@@ -6,7 +6,7 @@
 
 - Rust + Burn 实现 FSMN VAD 推理。
 - 使用 Burn Flex 后端，CPU 上即可运行。
-- 支持离线整段检测和流式 chunk 检测。
+- 支持离线整段检测和增量式流式 chunk 检测。
 - 提供 Python 绑定，方便在 Python 音频流水线中调用。
 - 内置 benchmark 示例和测试音频 `assets/vad_example.wav`。
 
@@ -96,5 +96,5 @@ cargo run --release -p vad-burn --example bench_fsmn_vad -- \
 
 | 模式 | 平均耗时 | RTF | 加速比 |
 | --- | ---: | ---: | ---: |
-| 离线整段 | 75.236 ms | 0.001068 | 936.66x |
-| 流式 600ms chunk | 1311.503 ms | 0.018611 | 53.73x |
+| 离线整段 | 70.914 ms | 0.001006 | 993.74x |
+| 流式 600ms chunk | 177.846 ms | 0.002524 | 396.24x |

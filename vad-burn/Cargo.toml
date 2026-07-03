@@ -12,8 +12,8 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
-python = ["dep:pyo3"]
-extension-module = ["python", "pyo3/abi3-py39", "pyo3/extension-module"]
+python = ["dep:pyo3", "pyo3/abi3-py39"]
+extension-module = ["python", "pyo3/extension-module"]
 
 [dependencies]
 anyhow = "1"

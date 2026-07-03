@@ -120,7 +120,7 @@ pub struct PyFsmnVadModel {
     inner: FsmnVadModel,
 }
 
-#[pyclass(name = "FsmnVadStream")]
+#[pyclass(name = "FsmnVadStream", unsendable)]
 pub struct PyFsmnVadStream {
     inner: FsmnVadStream,
 }
@@ -128,52 +128,60 @@ pub struct PyFsmnVadStream {
 #[pymethods]
 impl PyFsmnVadModel {
     #[new]
-    fn new(model_dir: &str) -> PyResult<Self> {
-        Ok(Self {
-            inner: FsmnVadModel::from_pretrained(model_dir)?,
-        })
+    fn new(py: Python<'_>, model_dir: &str) -> PyResult<Self> {
+        let model_dir = model_dir.to_owned();
+        let inner = py.allow_threads(move || FsmnVadModel::from_pretrained(model_dir))?;
+        Ok(Self { inner })
     }
 
     #[staticmethod]
-    fn from_pretrained(model_dir: &str) -> PyResult<Self> {
-        Self::new(model_dir)
+    fn from_pretrained(py: Python<'_>, model_dir: &str) -> PyResult<Self> {
+        Self::new(py, model_dir)
     }
 
     #[staticmethod]
     #[pyo3(signature = (repo_id=None, revision=None))]
-    fn from_modelscope(repo_id: Option<&str>, revision: Option<&str>) -> PyResult<Self> {
-        let inner = FsmnVadModel::from_modelscope_revision(
-            repo_id.unwrap_or(crate::DEFAULT_MODELSCOPE_REPO_ID),
-            revision.unwrap_or(crate::DEFAULT_MODELSCOPE_REVISION),
-        )?;
+    fn from_modelscope(
+        py: Python<'_>,
+        repo_id: Option<&str>,
+        revision: Option<&str>,
+    ) -> PyResult<Self> {
+        let repo_id = repo_id
+            .unwrap_or(crate::DEFAULT_MODELSCOPE_REPO_ID)
+            .to_owned();
+        let revision = revision
+            .unwrap_or(crate::DEFAULT_MODELSCOPE_REVISION)
+            .to_owned();
+        let inner =
+            py.allow_threads(move || FsmnVadModel::from_modelscope_revision(&repo_id, &revision))?;
         Ok(Self { inner })
     }
 
     fn detect(
         &self,
+        py: Python<'_>,
         samples: Vec<f32>,
         sample_rate: u32,
         options: Option<&PyVadOptions>,
     ) -> PyResult<Vec<PyVadSegment>> {
         let options = options.map_or_else(VadOptions::default, Into::into);
         let waveform = Waveform::new(samples, sample_rate);
-        Ok(self
-            .inner
-            .detect(&waveform, &options)?
-            .into_iter()
-            .map(Into::into)
-            .collect())
+        let segments = py.allow_threads(|| self.inner.detect(&waveform, &options))?;
+        Ok(segments.into_iter().map(Into::into).collect())
     }
 
     fn detect_with_timing(
         &self,
+        py: Python<'_>,
         samples: Vec<f32>,
         sample_rate: u32,
         options: Option<&PyVadOptions>,
     ) -> PyResult<PyVadDetection> {
         let options = options.map_or_else(VadOptions::default, Into::into);
         let waveform = Waveform::new(samples, sample_rate);
-        Ok(self.inner.detect_with_timing(&waveform, &options)?.into())
+        Ok(py
+            .allow_threads(|| self.inner.detect_with_timing(&waveform, &options))?
+            .into())
     }
 
     fn new_stream(&self, options: Option<&PyVadOptions>) -> PyFsmnVadStream {

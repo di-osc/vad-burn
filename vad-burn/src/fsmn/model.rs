@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 use burn::tensor::Tensor;
 
 use super::constants::{Backend, FEAT_DIM, SAMPLE_RATE};
-use super::frontend::FsmnVadFrontend;
+use super::frontend::{FsmnVadFeatureStream, FsmnVadFrontend};
 use super::post::{FsmnVadPostProcessor, FsmnVadStreamingPostProcessor};
 use super::timing::{FsmnForwardTiming, FsmnVadTiming};
 use super::weights::BurnFsmnWeights;
@@ -32,13 +32,12 @@ pub struct FsmnVadModel {
 }
 
 pub struct FsmnVadStream {
-    frontend: FsmnVadFrontend,
+    feature_stream: FsmnVadFeatureStream,
     weights: Arc<BurnFsmnWeights>,
     options: VadOptions,
     caches: Vec<Tensor<Backend, 2>>,
     post_processor: FsmnVadStreamingPostProcessor,
     samples: Vec<f32>,
-    processed_frames: usize,
     pending_samples: Vec<f32>,
     pending_frame_scores: Vec<Vec<f32>>,
     frame_scores: Vec<Vec<f32>>,
@@ -103,13 +102,12 @@ impl FsmnVadModel {
 
     pub fn new_stream(&self, options: VadOptions) -> FsmnVadStream {
         FsmnVadStream {
-            frontend: self.frontend.clone(),
+            feature_stream: self.frontend.new_stream(),
             weights: Arc::clone(&self.weights),
             caches: self.weights.zero_caches(),
             post_processor: FsmnVadStreamingPostProcessor::new(options.clone()),
             options,
             samples: Vec::new(),
-            processed_frames: 0,
             pending_samples: Vec::new(),
             pending_frame_scores: Vec::new(),
             frame_scores: Vec::new(),
@@ -243,16 +241,12 @@ impl FsmnVadStream {
         validate_waveform(&waveform)?;
 
         self.samples.extend_from_slice(samples);
-        let feats = self
-            .frontend
-            .extract_features_from_normalized_f32(&self.samples)?;
+        let feats = self.feature_stream.push_normalized_f32(samples)?;
         let [frames, feat_dim] = feats.dims();
         if feat_dim != FEAT_DIM {
             bail!("FSMN VAD expects feature dim {FEAT_DIM}, got {feat_dim}");
         }
-        let frame_scores = if frames > self.processed_frames {
-            let feats = feats.slice([self.processed_frames..frames, 0..FEAT_DIM]);
-            self.processed_frames = frames;
+        let frame_scores = if frames > 0 {
             self.weights
                 .forward_frame_scores_streaming(feats, &mut self.caches)?
         } else {
@@ -272,9 +266,9 @@ impl FsmnVadStream {
 
     pub fn reset(&mut self) {
         self.caches = self.weights.zero_caches();
+        self.feature_stream.reset();
         self.post_processor = FsmnVadStreamingPostProcessor::new(self.options.clone());
         self.samples.clear();
-        self.processed_frames = 0;
         self.pending_samples.clear();
         self.pending_frame_scores.clear();
         self.frame_scores.clear();

@@ -177,8 +177,10 @@ impl FsmnVadStreamingPostProcessor {
 }
 
 fn build_e2e_model(options: &VadOptions) -> E2EVadModel {
-    let mut config = E2EVadConfig::default();
-    config.speech_noise_thres = options.threshold;
+    let config = E2EVadConfig {
+        speech_noise_thres: options.threshold,
+        ..Default::default()
+    };
     E2EVadModel::new(config)
 }
 

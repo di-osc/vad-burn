@@ -1,4 +1,3 @@
-use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -16,6 +15,16 @@ pub struct FsmnVadFrontend {
     device: FlexDevice,
     cmvn_means: Option<FeatureTensor>,
     cmvn_vars: Option<FeatureTensor>,
+}
+
+pub struct FsmnVadFeatureStream {
+    config: WavFrontendConfig,
+    device: FlexDevice,
+    cmvn_means: Option<FeatureTensor>,
+    cmvn_vars: Option<FeatureTensor>,
+    fbank: OnlineFbank,
+    fbank_frames: Vec<Vec<f32>>,
+    emitted_lfr_frames: usize,
 }
 
 impl FsmnVadFrontend {
@@ -41,25 +50,20 @@ impl FsmnVadFrontend {
         Ok(self.apply_cmvn(lfr))
     }
 
+    pub fn new_stream(&self) -> FsmnVadFeatureStream {
+        FsmnVadFeatureStream {
+            config: self.config.clone(),
+            device: self.device,
+            cmvn_means: self.cmvn_means.clone(),
+            cmvn_vars: self.cmvn_vars.clone(),
+            fbank: OnlineFbank::new(self.fbank_options()),
+            fbank_frames: Vec::new(),
+            emitted_lfr_frames: 0,
+        }
+    }
+
     fn compute_fbank_features(&self, waveform: &[f32]) -> Result<FeatureTensor> {
-        let opt = FbankOptions {
-            frame_opts: FrameExtractionOptions {
-                samp_freq: self.config.sample_rate as f32,
-                window_type: CStr::from_bytes_with_nul(b"hamming\0")?.as_ptr(),
-                dither: 0.0,
-                frame_shift_ms: self.config.frame_shift_ms,
-                frame_length_ms: self.config.frame_length_ms,
-                snip_edges: true,
-                ..Default::default()
-            },
-            mel_opts: MelBanksOptions {
-                num_bins: self.config.n_mels as i32,
-                ..Default::default()
-            },
-            energy_floor: 0.0,
-            ..Default::default()
-        };
-        let mut fbank = OnlineFbank::new(opt);
+        let mut fbank = OnlineFbank::new(self.fbank_options());
         fbank.accept_waveform(self.config.sample_rate as f32, waveform);
         let frames = fbank.num_ready_frames() as usize;
         let mut out = Vec::with_capacity(frames * self.config.n_mels);
@@ -75,6 +79,10 @@ impl FsmnVadFrontend {
         ))
     }
 
+    fn fbank_options(&self) -> FbankOptions {
+        fbank_options(&self.config)
+    }
+
     fn apply_lfr(&self, fbank: FeatureTensor) -> FeatureTensor {
         let [t, _] = fbank.dims();
         let n_mels = self.config.n_mels;
@@ -88,7 +96,10 @@ impl FsmnVadFrontend {
         let padded = if left_padding_rows == 0 {
             fbank
         } else {
-            let left_pad = fbank.clone().slice([0..1]).repeat_dim(0, left_padding_rows);
+            let left_pad = fbank
+                .clone()
+                .slice([0..1, 0..n_mels])
+                .repeat_dim(0, left_padding_rows);
             Tensor::cat(vec![left_pad, fbank], 0)
         };
         let padded_rows = t + left_padding_rows;
@@ -109,13 +120,106 @@ impl FsmnVadFrontend {
     }
 
     fn apply_cmvn(&self, feats: FeatureTensor) -> FeatureTensor {
-        let (Some(means), Some(vars)) = (&self.cmvn_means, &self.cmvn_vars) else {
-            return feats;
-        };
-        if means.dims()[1] != feats.dims()[1] || vars.dims()[1] != feats.dims()[1] {
-            return feats;
+        apply_cmvn(feats, &self.cmvn_means, &self.cmvn_vars)
+    }
+}
+
+impl FsmnVadFeatureStream {
+    pub fn push_normalized_f32(&mut self, samples: &[f32]) -> Result<FeatureTensor> {
+        let waveform = samples
+            .iter()
+            .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
+            .collect::<Vec<_>>();
+        self.fbank
+            .accept_waveform(self.config.sample_rate as f32, &waveform);
+        self.collect_ready_fbank_frames()?;
+        let lfr = self.next_lfr_frames();
+        Ok(apply_cmvn(lfr, &self.cmvn_means, &self.cmvn_vars))
+    }
+
+    pub fn reset(&mut self) {
+        self.fbank = OnlineFbank::new(fbank_options(&self.config));
+        self.fbank_frames.clear();
+        self.emitted_lfr_frames = 0;
+    }
+
+    fn collect_ready_fbank_frames(&mut self) -> Result<()> {
+        let ready_frames = self.fbank.num_ready_frames() as usize;
+        for frame_idx in self.fbank_frames.len()..ready_frames {
+            let frame = self
+                .fbank
+                .get_frame(frame_idx as i32)
+                .ok_or_else(|| anyhow::anyhow!("missing fbank frame {frame_idx}"))?;
+            self.fbank_frames.push(frame.to_vec());
         }
-        (feats + means.clone()) * vars.clone()
+        Ok(())
+    }
+
+    fn next_lfr_frames(&mut self) -> FeatureTensor {
+        let fbank_rows = self.fbank_frames.len();
+        let n_mels = self.config.n_mels;
+        let feat_dim = n_mels * self.config.lfr_m;
+        if fbank_rows == 0 {
+            return Tensor::<Flex, 2>::zeros([0, feat_dim], &self.device);
+        }
+
+        let total_lfr_frames = fbank_rows.div_ceil(self.config.lfr_n);
+        if total_lfr_frames <= self.emitted_lfr_frames {
+            return Tensor::<Flex, 2>::zeros([0, feat_dim], &self.device);
+        }
+
+        let left_padding_rows = (self.config.lfr_m - 1) / 2;
+        let padded_rows = fbank_rows + left_padding_rows;
+        let new_lfr_frames = total_lfr_frames - self.emitted_lfr_frames;
+        let mut out = Vec::with_capacity(new_lfr_frames * feat_dim);
+
+        for row in self.emitted_lfr_frames..total_lfr_frames {
+            for m in 0..self.config.lfr_m {
+                let padded_idx = (row * self.config.lfr_n + m).min(padded_rows - 1);
+                let fbank_idx = padded_idx.saturating_sub(left_padding_rows);
+                out.extend_from_slice(&self.fbank_frames[fbank_idx]);
+            }
+        }
+        self.emitted_lfr_frames = total_lfr_frames;
+
+        Tensor::<Flex, 2>::from_data(
+            TensorData::new(out, [new_lfr_frames, feat_dim]),
+            &self.device,
+        )
+    }
+}
+
+fn apply_cmvn(
+    feats: FeatureTensor,
+    cmvn_means: &Option<FeatureTensor>,
+    cmvn_vars: &Option<FeatureTensor>,
+) -> FeatureTensor {
+    let (Some(means), Some(vars)) = (cmvn_means, cmvn_vars) else {
+        return feats;
+    };
+    if means.dims()[1] != feats.dims()[1] || vars.dims()[1] != feats.dims()[1] {
+        return feats;
+    }
+    (feats + means.clone()) * vars.clone()
+}
+
+fn fbank_options(config: &WavFrontendConfig) -> FbankOptions {
+    FbankOptions {
+        frame_opts: FrameExtractionOptions {
+            samp_freq: config.sample_rate as f32,
+            window_type: c"hamming".as_ptr(),
+            dither: 0.0,
+            frame_shift_ms: config.frame_shift_ms,
+            frame_length_ms: config.frame_length_ms,
+            snip_edges: true,
+            ..Default::default()
+        },
+        mel_opts: MelBanksOptions {
+            num_bins: config.n_mels as i32,
+            ..Default::default()
+        },
+        energy_floor: 0.0,
+        ..Default::default()
     }
 }
 
