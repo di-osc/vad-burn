@@ -1,6 +1,7 @@
 from .vad_burn import (
     FireRedVadDetection as FireRedVadDetection,
     FireRedVadModel as FireRedVadModel,
+    FireRedVadStream as FireRedVadStream,
     FireRedVadTiming as FireRedVadTiming,
     FsmnVadModel as FsmnVadModel,
     FsmnVadStream as FsmnVadStream,

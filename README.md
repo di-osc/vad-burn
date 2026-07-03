@@ -7,7 +7,7 @@
 - Rust + Burn 实现 FSMN VAD 推理。
 - 使用 Burn Flex 后端，CPU 上即可运行。
 - 支持离线整段检测和增量式流式 chunk 检测。
-- 支持 FireRedVAD 离线推理。
+- 支持 FireRedVAD 离线推理和官方 Stream-VAD 流式推理。
 - 提供 Python 绑定，方便在 Python 音频流水线中调用。
 - 内置 benchmark 示例和测试音频 `assets/vad_example.wav`。
 
@@ -60,6 +60,21 @@ let waveform = Waveform::new(samples, 16_000);
 let segments = model.detect(&waveform, &VadOptions::default())?;
 ```
 
+FireRedVAD 流式推理使用官方 `Stream-VAD` 模型：
+
+```rust
+use vad_burn::{FireRedVadModel, VadOptions};
+
+let model = FireRedVadModel::from_modelscope_stream()?;
+let mut stream = model.new_stream(VadOptions::default());
+
+for chunk in chunks {
+    let segments = stream.push(chunk, 16_000)?;
+}
+
+let final_segments = stream.finish();
+```
+
 ## Python 用法
 
 ```bash
@@ -94,6 +109,20 @@ from vad_burn import FireRedVadModel, VadOptions
 
 vad = FireRedVadModel.from_modelscope()
 segments = vad.detect(samples, 16000, VadOptions())
+```
+
+FireRedVAD 流式推理：
+
+```python
+from vad_burn import FireRedVadModel, VadOptions
+
+vad = FireRedVadModel.from_modelscope_stream()
+stream = vad.new_stream(VadOptions())
+
+for chunk in chunks:
+    segments = stream.push(chunk, 16000)
+
+final_segments = stream.finish()
 ```
 
 `samples` 为归一化到 `[-1.0, 1.0]` 的 `float` PCM 样本，采样率需为 `16000`。

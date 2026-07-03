@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,6 +26,8 @@ const BLOCKS: usize = 8;
 const FSMN_ORDER: usize = 20;
 const DEFAULT_THRESHOLD: f32 = 0.4;
 const DEFAULT_MAX_SPEECH_FRAME: usize = 2000;
+const STREAM_DEFAULT_SMOOTH_WINDOW_SIZE: usize = 5;
+const STREAM_DEFAULT_PAD_START_FRAME: usize = 5;
 
 pub const DEFAULT_FIRERED_MODELSCOPE_REPO_ID: &str = "xukaituo/FireRedVAD";
 pub const DEFAULT_FIRERED_MODELSCOPE_REVISION: &str = "master";
@@ -49,6 +52,15 @@ pub struct FireRedVadModel {
     model_dir: PathBuf,
 }
 
+pub struct FireRedVadStream {
+    feature_stream: FireRedFeatureStream,
+    weights: Arc<FireRedVadWeights>,
+    options: VadOptions,
+    caches: Vec<Tensor<Backend, 3>>,
+    postprocessor: FireRedStreamVadPostprocessor,
+    frame_scores: Vec<f32>,
+}
+
 impl FireRedVadModel {
     pub fn from_pretrained(model_dir: impl AsRef<Path>) -> Result<Self> {
         let model_dir = model_dir.as_ref().to_path_buf();
@@ -69,8 +81,30 @@ impl FireRedVadModel {
         runtime.block_on(Self::from_modelscope_revision_async(repo_id, revision))
     }
 
+    pub fn from_modelscope_stream() -> Result<Self> {
+        Self::from_modelscope_stream_revision(
+            DEFAULT_FIRERED_MODELSCOPE_REPO_ID,
+            DEFAULT_FIRERED_MODELSCOPE_REVISION,
+        )
+    }
+
+    pub fn from_modelscope_stream_revision(repo_id: &str, revision: &str) -> Result<Self> {
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(Self::from_modelscope_stream_revision_async(
+            repo_id, revision,
+        ))
+    }
+
     pub async fn from_modelscope_async() -> Result<Self> {
         Self::from_modelscope_revision_async(
+            DEFAULT_FIRERED_MODELSCOPE_REPO_ID,
+            DEFAULT_FIRERED_MODELSCOPE_REVISION,
+        )
+        .await
+    }
+
+    pub async fn from_modelscope_stream_async() -> Result<Self> {
+        Self::from_modelscope_stream_revision_async(
             DEFAULT_FIRERED_MODELSCOPE_REPO_ID,
             DEFAULT_FIRERED_MODELSCOPE_REVISION,
         )
@@ -83,8 +117,30 @@ impl FireRedVadModel {
         Self::from_pretrained(modelscope_snapshot_dir(&cache_dir, repo_id, revision).join("VAD"))
     }
 
+    pub async fn from_modelscope_stream_revision_async(
+        repo_id: &str,
+        revision: &str,
+    ) -> Result<Self> {
+        let cache_dir = modelhub::modelscope::cache_dir();
+        modelhub::modelscope::download_model_revision(repo_id, revision, &cache_dir).await?;
+        Self::from_pretrained(
+            modelscope_snapshot_dir(&cache_dir, repo_id, revision).join("Stream-VAD"),
+        )
+    }
+
     pub fn model_dir(&self) -> &Path {
         &self.model_dir
+    }
+
+    pub fn new_stream(&self, options: VadOptions) -> FireRedVadStream {
+        FireRedVadStream {
+            feature_stream: self.weights.frontend.new_stream(),
+            weights: Arc::clone(&self.weights),
+            caches: self.weights.zero_caches(),
+            postprocessor: FireRedStreamVadPostprocessor::from_options(&options),
+            options,
+            frame_scores: Vec::new(),
+        }
     }
 
     pub fn detect(&self, waveform: &Waveform, options: &VadOptions) -> Result<Vec<VadSegment>> {
@@ -132,6 +188,61 @@ impl FireRedVadModel {
     }
 }
 
+impl FireRedVadStream {
+    pub fn push(&mut self, samples: &[f32], sample_rate: u32) -> Result<Vec<VadSegment>> {
+        let waveform = Waveform::new(samples.to_vec(), sample_rate);
+        validate_waveform(&waveform)?;
+        let feats = self.feature_stream.push(&waveform.samples)?;
+        let [frames, feat_dim] = feats.dims();
+        if feat_dim != INPUT_DIM {
+            bail!("FireRedVAD expects feature dim {INPUT_DIM}, got {feat_dim}");
+        }
+        if frames == 0 {
+            return Ok(Vec::new());
+        }
+        let probs = self
+            .weights
+            .forward_probs_streaming(feats, &mut self.caches)?;
+        self.frame_scores.extend_from_slice(&probs);
+        Ok(self.postprocessor.process_probs(&probs))
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<VadSegment>> {
+        let feats = self.feature_stream.finish()?;
+        let [frames, feat_dim] = feats.dims();
+        if feat_dim != INPUT_DIM {
+            bail!("FireRedVAD expects feature dim {INPUT_DIM}, got {feat_dim}");
+        }
+        let mut segments = if frames == 0 {
+            Vec::new()
+        } else {
+            let probs = self
+                .weights
+                .forward_probs_streaming(feats, &mut self.caches)?;
+            self.frame_scores.extend_from_slice(&probs);
+            self.postprocessor.process_probs(&probs)
+        };
+        segments.extend(self.postprocessor.finish());
+        self.reset();
+        Ok(segments)
+    }
+
+    pub fn reset(&mut self) {
+        self.feature_stream = self.weights.frontend.new_stream();
+        self.caches = self.weights.zero_caches();
+        self.postprocessor = FireRedStreamVadPostprocessor::from_options(&self.options);
+        self.frame_scores.clear();
+    }
+
+    pub fn frame_scores(&self) -> &[f32] {
+        &self.frame_scores
+    }
+
+    pub fn options(&self) -> &VadOptions {
+        &self.options
+    }
+}
+
 struct FireRedVadWeights {
     frontend: FireRedFrontend,
     fc1: BurnLinear,
@@ -150,7 +261,7 @@ struct FireRedDfsmnBlock {
 
 struct FireRedFsmn {
     lookback_weight: Tensor<Backend, 3>,
-    lookahead_weight: Tensor<Backend, 3>,
+    lookahead_weight: Option<Tensor<Backend, 3>>,
 }
 
 struct BurnLinear {
@@ -232,6 +343,58 @@ impl FireRedVadWeights {
         }
         Ok(data)
     }
+
+    fn forward_probs_streaming(
+        &self,
+        feats: Tensor<Backend, 2>,
+        caches: &mut [Tensor<Backend, 3>],
+    ) -> Result<Vec<f32>> {
+        if caches.len() != self.fsmn_count() {
+            bail!(
+                "FireRedVAD expected {} FSMN caches, got {}",
+                self.fsmn_count(),
+                caches.len()
+            );
+        }
+        let [frames, dim] = feats.dims();
+        if dim != INPUT_DIM {
+            bail!("FireRedVAD expects feature dim {INPUT_DIM}, got {dim}");
+        }
+        if frames == 0 {
+            return Ok(Vec::new());
+        }
+        let mut x = self.fc1.forward(feats, true)?;
+        x = self.fc2.forward(x, true)?;
+        x = self.fsmn1.forward_streaming(x, &mut caches[0])?;
+        for (idx, block) in self.blocks.iter().enumerate() {
+            x = block.forward_streaming(x, &mut caches[idx + 1])?;
+        }
+        x = self.dnn.forward(x, true)?;
+        x = self.out.forward(x, false)?;
+        let probs = burn::tensor::activation::sigmoid(x);
+        let data = probs
+            .into_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("FireRedVAD streaming output tensor data");
+        if data.len() != frames {
+            bail!(
+                "FireRedVAD expected {frames} streaming probabilities, got {}",
+                data.len()
+            );
+        }
+        Ok(data)
+    }
+
+    fn zero_caches(&self) -> Vec<Tensor<Backend, 3>> {
+        (0..self.fsmn_count())
+            .map(|_| Tensor::<Backend, 3>::zeros([1, PROJ_DIM, FSMN_ORDER - 1], &FlexDevice))
+            .collect()
+    }
+
+    fn fsmn_count(&self) -> usize {
+        1 + self.blocks.len()
+    }
 }
 
 impl FireRedDfsmnBlock {
@@ -240,6 +403,17 @@ impl FireRedDfsmnBlock {
         let mut x = self.fc1.forward(input, true)?;
         x = self.fc2.forward(x, false)?;
         Ok(self.fsmn.forward(x)? + residual)
+    }
+
+    fn forward_streaming(
+        &self,
+        input: Tensor<Backend, 2>,
+        cache: &mut Tensor<Backend, 3>,
+    ) -> Result<Tensor<Backend, 2>> {
+        let residual = input.clone();
+        let mut x = self.fc1.forward(input, true)?;
+        x = self.fc2.forward(x, false)?;
+        Ok(self.fsmn.forward_streaming(x, cache)? + residual)
     }
 }
 
@@ -251,7 +425,7 @@ impl FireRedFsmn {
                 device,
                 &format!("{prefix}.lookback_filter.weight"),
             )?,
-            lookahead_weight: load_fsmn_weight(
+            lookahead_weight: load_optional_fsmn_weight(
                 reader,
                 device,
                 &format!("{prefix}.lookahead_filter.weight"),
@@ -276,7 +450,9 @@ impl FireRedFsmn {
             .reshape([PROJ_DIM, frames])
             .swap_dims(0, 1);
         let mut memory = input + lookback;
-        if frames > 1 {
+        if frames > 1
+            && let Some(lookahead_weight) = &self.lookahead_weight
+        {
             let padded = x.pad(
                 (0, FSMN_ORDER, 0, 0),
                 burn::tensor::ops::PadMode::Constant(0.0),
@@ -284,7 +460,7 @@ impl FireRedFsmn {
             let narrowed = padded.slice([0..1, 0..PROJ_DIM, 1..frames + FSMN_ORDER]);
             let lookahead = conv1d(
                 narrowed,
-                self.lookahead_weight.clone(),
+                lookahead_weight.clone(),
                 None,
                 ConvOptions::new([1], [0], [1], PROJ_DIM),
             )
@@ -293,6 +469,47 @@ impl FireRedFsmn {
             memory = memory + lookahead;
         }
         Ok(memory)
+    }
+
+    fn forward_streaming(
+        &self,
+        input: Tensor<Backend, 2>,
+        cache: &mut Tensor<Backend, 3>,
+    ) -> Result<Tensor<Backend, 2>> {
+        let [frames, proj_dim] = input.dims();
+        if proj_dim != PROJ_DIM {
+            bail!(
+                "unexpected FireRed streaming FSMN input shape: {:?}",
+                input.dims()
+            );
+        }
+        let [batch, cache_dim, cache_frames] = cache.dims();
+        if batch != 1 || cache_dim != PROJ_DIM || cache_frames != FSMN_ORDER - 1 {
+            bail!(
+                "unexpected FireRed streaming cache shape: {:?}",
+                cache.dims()
+            );
+        }
+        let x = input.clone().swap_dims(0, 1).reshape([1, PROJ_DIM, frames]);
+        let x_with_cache = Tensor::cat(vec![cache.clone(), x], 2);
+        let total_frames = cache_frames + frames;
+        *cache = x_with_cache.clone().slice([
+            0..1,
+            0..PROJ_DIM,
+            total_frames - cache_frames..total_frames,
+        ]);
+
+        let lookback = conv1d(
+            x_with_cache,
+            self.lookback_weight.clone(),
+            None,
+            ConvOptions::new([1], [FSMN_ORDER - 1], [1], PROJ_DIM),
+        );
+        let lookback = lookback
+            .slice([0..1, 0..PROJ_DIM, cache_frames..total_frames])
+            .reshape([PROJ_DIM, frames])
+            .swap_dims(0, 1);
+        Ok(input + lookback)
     }
 }
 
@@ -371,6 +588,12 @@ struct FireRedFrontend {
     device: FlexDevice,
 }
 
+struct FireRedFeatureStream {
+    frontend: FireRedFrontend,
+    fbank: OnlineFbank,
+    emitted_frames: usize,
+}
+
 impl FireRedFrontend {
     fn new(cmvn_path: &Path) -> Result<Self> {
         let (means, inverse_std) = read_kaldi_binary_cmvn(cmvn_path)?;
@@ -393,7 +616,46 @@ impl FireRedFrontend {
             .iter()
             .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
             .collect::<Vec<_>>();
-        let mut fbank = OnlineFbank::new(FbankOptions {
+        let mut fbank = OnlineFbank::new(Self::fbank_options());
+        fbank.accept_waveform(SAMPLE_RATE as f32, &waveform);
+        let frames = fbank.num_ready_frames() as usize;
+        self.collect_frames(&fbank, 0, frames)
+    }
+
+    fn new_stream(&self) -> FireRedFeatureStream {
+        FireRedFeatureStream {
+            frontend: self.clone(),
+            fbank: OnlineFbank::new(Self::fbank_options()),
+            emitted_frames: 0,
+        }
+    }
+
+    fn collect_frames(
+        &self,
+        fbank: &OnlineFbank,
+        start_frame: usize,
+        end_frame: usize,
+    ) -> Result<Tensor<Backend, 2>> {
+        if end_frame <= start_frame {
+            return Ok(Tensor::<Backend, 2>::zeros([0, INPUT_DIM], &self.device));
+        }
+        let mut out = Vec::with_capacity((end_frame - start_frame) * INPUT_DIM);
+        for frame_idx in start_frame..end_frame {
+            let frame = fbank
+                .get_frame(frame_idx as i32)
+                .ok_or_else(|| anyhow::anyhow!("missing FireRed fbank frame {frame_idx}"))?;
+            for (dim, value) in frame.iter().enumerate() {
+                out.push((*value - self.means[dim]) * self.inverse_std[dim]);
+            }
+        }
+        Ok(Tensor::<Backend, 2>::from_data(
+            TensorData::new(out, [end_frame - start_frame, INPUT_DIM]),
+            &self.device,
+        ))
+    }
+
+    fn fbank_options() -> FbankOptions {
+        FbankOptions {
             frame_opts: FrameExtractionOptions {
                 samp_freq: SAMPLE_RATE as f32,
                 dither: 0.0,
@@ -408,22 +670,32 @@ impl FireRedFrontend {
             },
             energy_floor: 0.0,
             ..Default::default()
-        });
-        fbank.accept_waveform(SAMPLE_RATE as f32, &waveform);
-        let frames = fbank.num_ready_frames() as usize;
-        let mut out = Vec::with_capacity(frames * INPUT_DIM);
-        for frame_idx in 0..frames as i32 {
-            let frame = fbank
-                .get_frame(frame_idx)
-                .ok_or_else(|| anyhow::anyhow!("missing FireRed fbank frame {frame_idx}"))?;
-            for (dim, value) in frame.iter().enumerate() {
-                out.push((*value - self.means[dim]) * self.inverse_std[dim]);
-            }
         }
-        Ok(Tensor::<Backend, 2>::from_data(
-            TensorData::new(out, [frames, INPUT_DIM]),
-            &self.device,
-        ))
+    }
+}
+
+impl FireRedFeatureStream {
+    fn push(&mut self, samples: &[f32]) -> Result<Tensor<Backend, 2>> {
+        let waveform = samples
+            .iter()
+            .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
+            .collect::<Vec<_>>();
+        self.fbank.accept_waveform(SAMPLE_RATE as f32, &waveform);
+        self.collect_ready_frames()
+    }
+
+    fn finish(&mut self) -> Result<Tensor<Backend, 2>> {
+        self.fbank.input_finished();
+        self.collect_ready_frames()
+    }
+
+    fn collect_ready_frames(&mut self) -> Result<Tensor<Backend, 2>> {
+        let frames = self.fbank.num_ready_frames() as usize;
+        let feats = self
+            .frontend
+            .collect_frames(&self.fbank, self.emitted_frames, frames)?;
+        self.emitted_frames = frames;
+        Ok(feats)
     }
 }
 
@@ -678,6 +950,198 @@ impl FireRedVadPostprocessor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FireRedStreamVadState {
+    Silence,
+    PossibleSpeech,
+    Speech,
+    PossibleSilence,
+}
+
+#[derive(Debug, Clone)]
+struct FireRedStreamVadPostprocessor {
+    smooth_window_size: usize,
+    speech_threshold: f32,
+    pad_start_frame: usize,
+    min_speech_frame: usize,
+    max_speech_frame: usize,
+    min_silence_frame: usize,
+    frame_cnt: usize,
+    smooth_window: VecDeque<f32>,
+    smooth_window_sum: f32,
+    state: FireRedStreamVadState,
+    speech_cnt: usize,
+    silence_cnt: usize,
+    hit_max_speech: bool,
+    last_speech_start_frame: Option<usize>,
+    last_speech_end_frame: Option<usize>,
+}
+
+impl FireRedStreamVadPostprocessor {
+    fn from_options(options: &VadOptions) -> Self {
+        let smooth_window_size = STREAM_DEFAULT_SMOOTH_WINDOW_SIZE;
+        let pad_start_frame = if options.pad_ms > 0 {
+            ms_to_frame_count(options.pad_ms)
+        } else {
+            STREAM_DEFAULT_PAD_START_FRAME
+        };
+        Self {
+            smooth_window_size,
+            speech_threshold: if options.threshold > 0.0 {
+                options.threshold
+            } else {
+                0.5
+            },
+            pad_start_frame: pad_start_frame.max(smooth_window_size),
+            min_speech_frame: ms_to_frame_count(options.min_speech_ms),
+            max_speech_frame: if options.max_segment_ms > 0 {
+                ms_to_frame_count(options.max_segment_ms)
+            } else {
+                DEFAULT_MAX_SPEECH_FRAME
+            },
+            min_silence_frame: ms_to_frame_count(options.min_silence_ms),
+            frame_cnt: 0,
+            smooth_window: VecDeque::new(),
+            smooth_window_sum: 0.0,
+            state: FireRedStreamVadState::Silence,
+            speech_cnt: 0,
+            silence_cnt: 0,
+            hit_max_speech: false,
+            last_speech_start_frame: None,
+            last_speech_end_frame: None,
+        }
+    }
+
+    fn process_probs(&mut self, probs: &[f32]) -> Vec<VadSegment> {
+        probs
+            .iter()
+            .filter_map(|prob| self.process_one_frame(*prob))
+            .collect()
+    }
+
+    fn process_one_frame(&mut self, raw_prob: f32) -> Option<VadSegment> {
+        self.frame_cnt += 1;
+        let smoothed_prob = self.smooth_prob(raw_prob.clamp(0.0, 1.0));
+        let is_speech = smoothed_prob >= self.speech_threshold;
+        self.state_transition(is_speech)
+    }
+
+    fn finish(&mut self) -> Vec<VadSegment> {
+        self.last_speech_start_frame
+            .take()
+            .and_then(|start| self.segment_from_frames(start, self.frame_cnt))
+            .into_iter()
+            .collect()
+    }
+
+    fn smooth_prob(&mut self, prob: f32) -> f32 {
+        if self.smooth_window_size <= 1 {
+            return prob;
+        }
+        self.smooth_window.push_back(prob);
+        self.smooth_window_sum += prob;
+        if self.smooth_window.len() > self.smooth_window_size
+            && let Some(left) = self.smooth_window.pop_front()
+        {
+            self.smooth_window_sum -= left;
+        }
+        self.smooth_window_sum / self.smooth_window.len() as f32
+    }
+
+    fn state_transition(&mut self, is_speech: bool) -> Option<VadSegment> {
+        if self.hit_max_speech {
+            self.last_speech_start_frame = Some(self.frame_cnt);
+            self.hit_max_speech = false;
+        }
+
+        match self.state {
+            FireRedStreamVadState::Silence => {
+                if is_speech {
+                    self.state = FireRedStreamVadState::PossibleSpeech;
+                    self.speech_cnt += 1;
+                } else {
+                    self.silence_cnt += 1;
+                    self.speech_cnt = 0;
+                }
+            }
+            FireRedStreamVadState::PossibleSpeech => {
+                if is_speech {
+                    self.speech_cnt += 1;
+                    if self.speech_cnt >= self.min_speech_frame {
+                        self.state = FireRedStreamVadState::Speech;
+                        let previous_end = self.last_speech_end_frame.unwrap_or(0);
+                        let start = self
+                            .frame_cnt
+                            .saturating_sub(self.speech_cnt)
+                            .saturating_add(1)
+                            .saturating_sub(self.pad_start_frame)
+                            .max(1)
+                            .max(previous_end.saturating_add(1));
+                        self.last_speech_start_frame = Some(start);
+                        self.silence_cnt = 0;
+                    }
+                } else {
+                    self.state = FireRedStreamVadState::Silence;
+                    self.silence_cnt = 1;
+                    self.speech_cnt = 0;
+                }
+            }
+            FireRedStreamVadState::Speech => {
+                self.speech_cnt += 1;
+                if is_speech {
+                    self.silence_cnt = 0;
+                    if self.speech_cnt >= self.max_speech_frame {
+                        return self.close_current_segment(true);
+                    }
+                } else {
+                    self.state = FireRedStreamVadState::PossibleSilence;
+                    self.silence_cnt += 1;
+                }
+            }
+            FireRedStreamVadState::PossibleSilence => {
+                self.speech_cnt += 1;
+                if is_speech {
+                    self.state = FireRedStreamVadState::Speech;
+                    self.silence_cnt = 0;
+                    if self.speech_cnt >= self.max_speech_frame {
+                        return self.close_current_segment(true);
+                    }
+                } else {
+                    self.silence_cnt += 1;
+                    if self.silence_cnt >= self.min_silence_frame {
+                        self.state = FireRedStreamVadState::Silence;
+                        let segment = self.close_current_segment(false);
+                        self.speech_cnt = 0;
+                        return segment;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn close_current_segment(&mut self, hit_max_speech: bool) -> Option<VadSegment> {
+        self.hit_max_speech = hit_max_speech;
+        self.speech_cnt = 0;
+        let start = self.last_speech_start_frame.take()?;
+        let end = self.frame_cnt;
+        self.last_speech_end_frame = Some(end);
+        self.segment_from_frames(start, end)
+    }
+
+    fn segment_from_frames(&self, start_frame: usize, end_frame: usize) -> Option<VadSegment> {
+        let start_ms = start_frame.saturating_sub(1) as u64 * FRAME_SHIFT_MS;
+        let end_ms = end_frame.saturating_sub(1) as u64 * FRAME_SHIFT_MS;
+        if end_ms.saturating_sub(start_ms) < self.min_speech_frame as u64 * FRAME_SHIFT_MS {
+            return None;
+        }
+        Some(VadSegment {
+            range: TimeRange::new(DurationMs(start_ms), DurationMs(end_ms)),
+            probability: self.speech_threshold,
+        })
+    }
+}
+
 fn ms_to_frame_count(ms: u64) -> usize {
     ms.div_ceil(FRAME_SHIFT_MS).max(1) as usize
 }
@@ -756,6 +1220,17 @@ fn load_fsmn_weight(
         TensorData::new(load_vec(reader, key)?, [PROJ_DIM, 1, FSMN_ORDER]),
         device,
     ))
+}
+
+fn load_optional_fsmn_weight(
+    reader: &PytorchReader,
+    device: &FlexDevice,
+    key: &str,
+) -> Result<Option<Tensor<Backend, 3>>> {
+    if reader.get(key).is_none() {
+        return Ok(None);
+    }
+    load_fsmn_weight(reader, device, key).map(Some)
 }
 
 fn read_kaldi_binary_cmvn(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {

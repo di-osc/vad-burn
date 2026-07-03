@@ -6,7 +6,7 @@ mod types;
 
 pub use firered::{
     DEFAULT_FIRERED_MODELSCOPE_REPO_ID, DEFAULT_FIRERED_MODELSCOPE_REVISION, FireRedVadDetection,
-    FireRedVadModel, FireRedVadTiming,
+    FireRedVadModel, FireRedVadStream, FireRedVadTiming,
 };
 pub use fsmn::{
     DEFAULT_MODELSCOPE_REPO_ID, DEFAULT_MODELSCOPE_REVISION, FeatureTensor, FsmnForwardTiming,

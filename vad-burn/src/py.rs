@@ -1,8 +1,8 @@
 use pyo3::prelude::*;
 
 use crate::{
-    FireRedVadDetection, FireRedVadModel, FireRedVadTiming, FsmnVadDetection, FsmnVadModel,
-    FsmnVadStream, FsmnVadTiming, VadOptions, VadSegment, Waveform,
+    FireRedVadDetection, FireRedVadModel, FireRedVadStream, FireRedVadTiming, FsmnVadDetection,
+    FsmnVadModel, FsmnVadStream, FsmnVadTiming, VadOptions, VadSegment, Waveform,
 };
 
 #[pyclass(name = "VadOptions")]
@@ -260,6 +260,11 @@ pub struct PyFireRedVadModel {
     inner: FireRedVadModel,
 }
 
+#[pyclass(name = "FireRedVadStream", unsendable)]
+pub struct PyFireRedVadStream {
+    inner: FireRedVadStream,
+}
+
 #[pyclass(name = "FsmnVadStream", unsendable)]
 pub struct PyFsmnVadStream {
     inner: FsmnVadStream,
@@ -376,6 +381,25 @@ impl PyFireRedVadModel {
         Ok(Self { inner })
     }
 
+    #[staticmethod]
+    #[pyo3(signature = (repo_id=None, revision=None))]
+    fn from_modelscope_stream(
+        py: Python<'_>,
+        repo_id: Option<&str>,
+        revision: Option<&str>,
+    ) -> PyResult<Self> {
+        let repo_id = repo_id
+            .unwrap_or(crate::DEFAULT_FIRERED_MODELSCOPE_REPO_ID)
+            .to_owned();
+        let revision = revision
+            .unwrap_or(crate::DEFAULT_FIRERED_MODELSCOPE_REVISION)
+            .to_owned();
+        let inner = py.allow_threads(move || {
+            FireRedVadModel::from_modelscope_stream_revision(&repo_id, &revision)
+        })?;
+        Ok(Self { inner })
+    }
+
     #[pyo3(signature = (samples, sample_rate, options=None))]
     fn detect(
         &self,
@@ -405,8 +429,44 @@ impl PyFireRedVadModel {
             .into())
     }
 
+    #[pyo3(signature = (options=None))]
+    fn new_stream(&self, options: Option<&PyVadOptions>) -> PyFireRedVadStream {
+        let options = options.map_or_else(VadOptions::default, Into::into);
+        PyFireRedVadStream {
+            inner: self.inner.new_stream(options),
+        }
+    }
+
     fn __repr__(&self) -> String {
         "FireRedVadModel()".to_owned()
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
+    }
+}
+
+#[pymethods]
+impl PyFireRedVadStream {
+    fn push(&mut self, samples: Vec<f32>, sample_rate: u32) -> PyResult<Vec<PyVadSegment>> {
+        Ok(self
+            .inner
+            .push(&samples, sample_rate)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    fn finish(&mut self) -> PyResult<Vec<PyVadSegment>> {
+        Ok(self.inner.finish()?.into_iter().map(Into::into).collect())
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    fn __repr__(&self) -> String {
+        "FireRedVadStream()".to_owned()
     }
 
     fn __str__(&self) -> String {
@@ -447,6 +507,7 @@ fn vad_burn(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFsmnVadModel>()?;
     m.add_class::<PyFireRedVadModel>()?;
     m.add_class::<PyFsmnVadStream>()?;
+    m.add_class::<PyFireRedVadStream>()?;
     m.add_class::<PyVadOptions>()?;
     m.add_class::<PyVadSegment>()?;
     m.add_class::<PyVadTiming>()?;

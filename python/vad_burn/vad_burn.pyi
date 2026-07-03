@@ -229,11 +229,44 @@ class FsmnVadModel:
     def __str__(self) -> str: ...
 
 
+class FireRedVadStream:
+    """Stateful streaming FireRedVAD session.
+
+    A stream owns mutable FSMN caches and streaming post-processing state. Do
+    not call push(), finish(), or reset() concurrently on the same stream. For
+    parallel streaming sessions, create one stream per audio stream with
+    FireRedVadModel.new_stream().
+    """
+
+    def push(self, samples: Sequence[float], sample_rate: int) -> list[VadSegment]:
+        """Push one mono 16 kHz audio chunk and return newly finalized segments.
+
+        Samples must be normalized float PCM values, usually in the range
+        [-1.0, 1.0]. FireRedVAD streaming should be created from the official
+        Stream-VAD model, for example FireRedVadModel.from_modelscope_stream().
+        """
+        ...
+
+    def finish(self) -> list[VadSegment]:
+        """Flush an open speech segment, return remaining segments, and reset state."""
+        ...
+
+    def reset(self) -> None:
+        """Clear stream state, FSMN caches, and cached frame scores."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+    def __str__(self) -> str: ...
+
+
 class FireRedVadModel:
     """FireRedVAD model implemented with Burn Flex.
 
-    This model currently exposes offline inference only. The loaded model can
-    be shared across threads for concurrent detect() calls.
+    The loaded model can be shared across threads for concurrent offline
+    detect() calls and for creating independent streaming sessions. For
+    streaming, load the official Stream-VAD model with from_modelscope_stream()
+    or pass a local Stream-VAD directory to from_pretrained().
     """
 
     def __init__(self, model_dir: str) -> None:
@@ -254,6 +287,18 @@ class FireRedVadModel:
 
         Defaults to repo_id "xukaituo/FireRedVAD" and revision "master".
         The model files are loaded from the VAD subdirectory.
+        """
+        ...
+
+    @staticmethod
+    def from_modelscope_stream(
+        repo_id: Optional[str] = None,
+        revision: Optional[str] = None,
+    ) -> FireRedVadModel:
+        """Download through ModelScope cache and load FireRedVAD Stream-VAD.
+
+        Defaults to repo_id "xukaituo/FireRedVAD" and revision "master".
+        The model files are loaded from the Stream-VAD subdirectory.
         """
         ...
 
@@ -279,6 +324,15 @@ class FireRedVadModel:
         """Run offline FireRedVAD and return segments, frame scores, and timing.
 
         This method releases the Python GIL while running Rust inference.
+        """
+        ...
+
+    def new_stream(self, options: Optional[VadOptions] = None) -> FireRedVadStream:
+        """Create a stateful streaming FireRedVAD session from this loaded model.
+
+        Use FireRedVadModel.from_modelscope_stream() or a local Stream-VAD
+        directory for official streaming weights. Use one stream per audio
+        stream when running multiple streams in parallel.
         """
         ...
 
