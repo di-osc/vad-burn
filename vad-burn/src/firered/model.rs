@@ -129,7 +129,19 @@ impl FireRedVadModel {
     }
 
     pub fn detect(&self, waveform: &Waveform, options: &VadOptions) -> Result<Vec<VadSegment>> {
-        Ok(self.detect_with_timing(waveform, options)?.segments)
+        validate_waveform(waveform)?;
+
+        let feats = self.offline_weights.frontend.extract(&waveform.samples)?;
+        let [frames, feat_dim] = feats.dims();
+        if feat_dim != INPUT_DIM {
+            bail!("FireRedVAD expects feature dim {INPUT_DIM}, got {feat_dim}");
+        }
+        if frames == 0 {
+            return Ok(Vec::new());
+        }
+
+        let probs = self.offline_weights.forward_probs(feats)?;
+        Ok(FireRedVadPostprocessor::from_options(options).process_to_segments(&probs, waveform))
     }
 
     pub fn detect_with_timing(
@@ -459,17 +471,13 @@ impl FireRedFsmn {
         if frames > 1
             && let Some(lookahead_tensor) = &self.lookahead_tensor
         {
-            let padded = x.pad(
-                (0, FSMN_ORDER, 0, 0),
-                burn::tensor::ops::PadMode::Constant(0.0),
-            );
-            let narrowed = padded.slice([0..1, 0..PROJ_DIM, 1..frames + FSMN_ORDER]);
             let lookahead = conv1d(
-                narrowed,
+                x,
                 lookahead_tensor.clone(),
                 None,
-                ConvOptions::new([1], [0], [1], PROJ_DIM),
+                ConvOptions::new([1], [FSMN_ORDER], [1], PROJ_DIM),
             )
+            .slice([0..1, 0..PROJ_DIM, FSMN_ORDER + 1..FSMN_ORDER + 1 + frames])
             .reshape([PROJ_DIM, frames])
             .swap_dims(0, 1);
             memory = memory + lookahead;
@@ -612,7 +620,7 @@ impl BurnLinear {
         }
         let mut out = input.matmul(self.weight_t.clone());
         if let Some(bias) = &self.bias {
-            out = out + bias.clone().unsqueeze_dim::<2>(0).repeat_dim(0, rows);
+            out = out + bias.clone().unsqueeze_dim::<2>(0);
         }
         let [actual_rows, out_dim] = out.dims();
         if actual_rows != rows || out_dim != self.out_dim {
