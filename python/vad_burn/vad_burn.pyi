@@ -131,7 +131,13 @@ class FireRedVadDetection:
 
 
 class FsmnVadStream:
-    """Stateful streaming FSMN VAD session."""
+    """Stateful streaming FSMN VAD session.
+
+    A stream owns mutable decoding state and should be driven sequentially by
+    one audio stream. Do not call push(), finish(), or reset() concurrently on
+    the same stream. For parallel streaming sessions, create one stream per
+    audio stream with FsmnVadModel.new_stream().
+    """
 
     def push(self, samples: Sequence[float], sample_rate: int) -> list[VadSegment]:
         """Push one mono 16 kHz audio chunk and return newly finalized segments.
@@ -156,7 +162,13 @@ class FsmnVadStream:
 
 
 class FsmnVadModel:
-    """FSMN VAD model."""
+    """FSMN VAD model.
+
+    The loaded model can be shared across threads for offline detect() calls
+    and for creating independent streaming sessions. Each new_stream() call
+    returns a separate stateful stream; the stream itself is not a shared
+    concurrent object.
+    """
 
     def __init__(self, model_dir: str) -> None:
         """Load a local model directory containing model.pt and am.mvn."""
@@ -187,7 +199,8 @@ class FsmnVadModel:
     ) -> list[VadSegment]:
         """Run offline VAD on mono normalized float PCM samples.
 
-        sample_rate must be 16000.
+        sample_rate must be 16000. This method releases the Python GIL while
+        running Rust inference.
         """
         ...
 
@@ -197,11 +210,18 @@ class FsmnVadModel:
         sample_rate: int,
         options: Optional[VadOptions] = None,
     ) -> VadDetection:
-        """Run offline VAD and return segments, model frame scores, and timing."""
+        """Run offline VAD and return segments, model frame scores, and timing.
+
+        This method releases the Python GIL while running Rust inference.
+        """
         ...
 
     def new_stream(self, options: Optional[VadOptions] = None) -> FsmnVadStream:
-        """Create a stateful streaming VAD session from this loaded model."""
+        """Create a stateful streaming VAD session from this loaded model.
+
+        Use one stream per audio stream when running multiple streams in
+        parallel.
+        """
         ...
 
     def __repr__(self) -> str: ...
@@ -210,7 +230,11 @@ class FsmnVadModel:
 
 
 class FireRedVadModel:
-    """FireRedVAD model implemented with Burn Flex."""
+    """FireRedVAD model implemented with Burn Flex.
+
+    This model currently exposes offline inference only. The loaded model can
+    be shared across threads for concurrent detect() calls.
+    """
 
     def __init__(self, model_dir: str) -> None:
         """Load a local FireRedVAD VAD directory containing model.pth.tar and cmvn.ark."""
@@ -241,7 +265,8 @@ class FireRedVadModel:
     ) -> list[VadSegment]:
         """Run offline FireRedVAD on mono normalized float PCM samples.
 
-        sample_rate must be 16000.
+        sample_rate must be 16000. This method releases the Python GIL while
+        running Rust inference.
         """
         ...
 
@@ -251,7 +276,10 @@ class FireRedVadModel:
         sample_rate: int,
         options: Optional[VadOptions] = None,
     ) -> FireRedVadDetection:
-        """Run offline FireRedVAD and return segments, frame scores, and timing."""
+        """Run offline FireRedVAD and return segments, frame scores, and timing.
+
+        This method releases the Python GIL while running Rust inference.
+        """
         ...
 
     def __repr__(self) -> str: ...
