@@ -5624,12 +5624,7 @@ dependencies = [
  "burn-store",
  "kaldi-fbank-rust-kautism",
  "pyo3",
- "vad-data",
 ]
-
-[[package]]
-name = "vad-data"
-version = "0.1.0"
 
 [[package]]
 name = "variadics_please"

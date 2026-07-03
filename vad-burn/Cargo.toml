@@ -22,7 +22,6 @@ burn-flex = { version = "0.21.0", default-features = false, features = ["rayon"]
 burn-store = "0.21.0"
 kaldi-fbank-rust-kautism = "0.1.0"
 pyo3 = { version = "0.25.1", optional = true, features = ["anyhow"] }
-vad-data = { version = "0.1.0", path = "../vad-data" }
 
 [lints]
 workspace = true

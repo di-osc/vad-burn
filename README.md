@@ -15,12 +15,10 @@
 ```toml
 [dependencies]
 vad-burn = "0.1"
-vad-data = "0.1"
 ```
 
 ```rust
-use vad_burn::{BurnFsmnVadModel, VadOptions};
-use vad_data::Waveform;
+use vad_burn::{BurnFsmnVadModel, VadOptions, Waveform};
 
 let model = BurnFsmnVadModel::from_pretrained("/path/to/fsmn-vad")?;
 let waveform = Waveform::new(samples, 16_000);

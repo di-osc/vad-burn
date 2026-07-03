@@ -1,7 +1,8 @@
 use pyo3::prelude::*;
-use vad_data::Waveform;
 
-use crate::{BurnFsmnVadDetection, BurnFsmnVadModel, BurnFsmnVadTiming, VadOptions, VadSegment};
+use crate::{
+    BurnFsmnVadDetection, BurnFsmnVadModel, BurnFsmnVadTiming, VadOptions, VadSegment, Waveform,
+};
 
 #[pyclass(name = "VadOptions")]
 #[derive(Debug, Clone)]

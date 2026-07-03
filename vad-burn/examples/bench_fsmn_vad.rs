@@ -2,8 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use vad_burn::{BurnFsmnForwardTiming, BurnFsmnVadModel, VadOptions};
-use vad_data::Waveform;
+use vad_burn::{BurnFsmnForwardTiming, BurnFsmnVadModel, VadOptions, Waveform};
 
 fn main() -> Result<()> {
     let args = Args::parse()?;

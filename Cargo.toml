@@ -1,5 +1,5 @@
 [workspace]
-members = ["vad-burn", "vad-data"]
+members = ["vad-burn"]
 resolver = "2"
 
 [workspace.package]

@@ -3,14 +3,13 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use burn::tensor::Tensor;
-use vad_data::Waveform;
 
 use super::constants::{Backend, FEAT_DIM, SAMPLE_RATE};
 use super::frontend::FsmnVadFrontend;
 use super::post::{FsmnVadPostProcessor, FsmnVadStreamingPostProcessor};
 use super::timing::{BurnFsmnForwardTiming, BurnFsmnVadTiming};
 use super::weights::BurnFsmnWeights;
-use crate::{VadOptions, VadSegment};
+use crate::{VadOptions, VadSegment, Waveform};
 
 pub type BurnFeatureTensor = Tensor<Backend, 2>;
 

@@ -1,8 +1,6 @@
-use anyhow::Result;
-use vad_data::Waveform;
-
 use super::e2e::{E2EVadConfig, E2EVadModel};
-use crate::{DurationMs, TimeRange, VadOptions, VadSegment};
+use crate::{DurationMs, TimeRange, VadOptions, VadSegment, Waveform};
+use anyhow::Result;
 
 pub const FRAME_SHIFT_SAMPLES: usize = 160;
 pub const FRAME_LENGTH_SAMPLES: usize = 400;
