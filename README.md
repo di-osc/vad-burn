@@ -7,6 +7,7 @@
 - Rust + Burn 实现 FSMN VAD 推理。
 - 使用 Burn Flex 后端，CPU 上即可运行。
 - 支持离线整段检测和增量式流式 chunk 检测。
+- 支持 FireRedVAD 离线推理。
 - 提供 Python 绑定，方便在 Python 音频流水线中调用。
 - 内置 benchmark 示例和测试音频 `assets/vad_example.wav`。
 
@@ -49,6 +50,16 @@ for chunk in chunks {
 let final_segments = stream.finish()?;
 ```
 
+FireRedVAD 离线推理：
+
+```rust
+use vad_burn::{FireRedVadModel, VadOptions, Waveform};
+
+let model = FireRedVadModel::from_modelscope()?;
+let waveform = Waveform::new(samples, 16_000);
+let segments = model.detect(&waveform, &VadOptions::default())?;
+```
+
 ## Python 用法
 
 ```bash
@@ -74,6 +85,15 @@ for chunk in chunks:
     segments = stream.push(chunk, 16000)
 
 final_segments = stream.finish()
+```
+
+FireRedVAD 离线推理：
+
+```python
+from vad_burn import FireRedVadModel, VadOptions
+
+vad = FireRedVadModel.from_modelscope()
+segments = vad.detect(samples, 16000, VadOptions())
 ```
 
 `samples` 为归一化到 `[-1.0, 1.0]` 的 `float` PCM 样本，采样率需为 `16000`。

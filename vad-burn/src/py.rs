@@ -1,7 +1,8 @@
 use pyo3::prelude::*;
 
 use crate::{
-    FsmnVadDetection, FsmnVadModel, FsmnVadStream, FsmnVadTiming, VadOptions, VadSegment, Waveform,
+    FireRedVadDetection, FireRedVadModel, FireRedVadTiming, FsmnVadDetection, FsmnVadModel,
+    FsmnVadStream, FsmnVadTiming, VadOptions, VadSegment, Waveform,
 };
 
 #[pyclass(name = "VadOptions")]
@@ -115,9 +116,59 @@ impl From<FsmnVadDetection> for PyVadDetection {
     }
 }
 
+#[pyclass(name = "FireRedVadTiming")]
+#[derive(Debug, Clone)]
+pub struct PyFireRedVadTiming {
+    #[pyo3(get)]
+    pub frontend_seconds: f64,
+    #[pyo3(get)]
+    pub forward_seconds: f64,
+    #[pyo3(get)]
+    pub postprocess_seconds: f64,
+    #[pyo3(get)]
+    pub frames: usize,
+}
+
+impl From<FireRedVadTiming> for PyFireRedVadTiming {
+    fn from(timing: FireRedVadTiming) -> Self {
+        Self {
+            frontend_seconds: timing.frontend_seconds,
+            forward_seconds: timing.forward_seconds,
+            postprocess_seconds: timing.postprocess_seconds,
+            frames: timing.frames,
+        }
+    }
+}
+
+#[pyclass(name = "FireRedVadDetection")]
+#[derive(Debug, Clone)]
+pub struct PyFireRedVadDetection {
+    #[pyo3(get)]
+    pub segments: Vec<PyVadSegment>,
+    #[pyo3(get)]
+    pub frame_scores: Vec<f32>,
+    #[pyo3(get)]
+    pub timing: PyFireRedVadTiming,
+}
+
+impl From<FireRedVadDetection> for PyFireRedVadDetection {
+    fn from(detection: FireRedVadDetection) -> Self {
+        Self {
+            segments: detection.segments.into_iter().map(Into::into).collect(),
+            frame_scores: detection.frame_scores,
+            timing: detection.timing.into(),
+        }
+    }
+}
+
 #[pyclass(name = "FsmnVadModel")]
 pub struct PyFsmnVadModel {
     inner: FsmnVadModel,
+}
+
+#[pyclass(name = "FireRedVadModel")]
+pub struct PyFireRedVadModel {
+    inner: FireRedVadModel,
 }
 
 #[pyclass(name = "FsmnVadStream", unsendable)]
@@ -193,6 +244,67 @@ impl PyFsmnVadModel {
 }
 
 #[pymethods]
+impl PyFireRedVadModel {
+    #[new]
+    fn new(py: Python<'_>, model_dir: &str) -> PyResult<Self> {
+        let model_dir = model_dir.to_owned();
+        let inner = py.allow_threads(move || FireRedVadModel::from_pretrained(model_dir))?;
+        Ok(Self { inner })
+    }
+
+    #[staticmethod]
+    fn from_pretrained(py: Python<'_>, model_dir: &str) -> PyResult<Self> {
+        Self::new(py, model_dir)
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (repo_id=None, revision=None))]
+    fn from_modelscope(
+        py: Python<'_>,
+        repo_id: Option<&str>,
+        revision: Option<&str>,
+    ) -> PyResult<Self> {
+        let repo_id = repo_id
+            .unwrap_or(crate::DEFAULT_FIRERED_MODELSCOPE_REPO_ID)
+            .to_owned();
+        let revision = revision
+            .unwrap_or(crate::DEFAULT_FIRERED_MODELSCOPE_REVISION)
+            .to_owned();
+        let inner = py.allow_threads(move || {
+            FireRedVadModel::from_modelscope_revision(&repo_id, &revision)
+        })?;
+        Ok(Self { inner })
+    }
+
+    fn detect(
+        &self,
+        py: Python<'_>,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        options: Option<&PyVadOptions>,
+    ) -> PyResult<Vec<PyVadSegment>> {
+        let options = options.map_or_else(VadOptions::default, Into::into);
+        let waveform = Waveform::new(samples, sample_rate);
+        let segments = py.allow_threads(|| self.inner.detect(&waveform, &options))?;
+        Ok(segments.into_iter().map(Into::into).collect())
+    }
+
+    fn detect_with_timing(
+        &self,
+        py: Python<'_>,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        options: Option<&PyVadOptions>,
+    ) -> PyResult<PyFireRedVadDetection> {
+        let options = options.map_or_else(VadOptions::default, Into::into);
+        let waveform = Waveform::new(samples, sample_rate);
+        Ok(py
+            .allow_threads(|| self.inner.detect_with_timing(&waveform, &options))?
+            .into())
+    }
+}
+
+#[pymethods]
 impl PyFsmnVadStream {
     fn push(&mut self, samples: Vec<f32>, sample_rate: u32) -> PyResult<Vec<PyVadSegment>> {
         Ok(self
@@ -215,10 +327,13 @@ impl PyFsmnVadStream {
 #[pymodule]
 fn vad_burn(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFsmnVadModel>()?;
+    m.add_class::<PyFireRedVadModel>()?;
     m.add_class::<PyFsmnVadStream>()?;
     m.add_class::<PyVadOptions>()?;
     m.add_class::<PyVadSegment>()?;
     m.add_class::<PyVadTiming>()?;
     m.add_class::<PyVadDetection>()?;
+    m.add_class::<PyFireRedVadTiming>()?;
+    m.add_class::<PyFireRedVadDetection>()?;
     Ok(())
 }

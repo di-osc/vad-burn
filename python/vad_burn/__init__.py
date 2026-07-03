@@ -1,4 +1,7 @@
 from .vad_burn import (
+    FireRedVadDetection,
+    FireRedVadModel,
+    FireRedVadTiming,
     FsmnVadModel,
     FsmnVadStream,
     VadDetection,
@@ -8,6 +11,9 @@ from .vad_burn import (
 )
 
 __all__ = [
+    "FireRedVadDetection",
+    "FireRedVadModel",
+    "FireRedVadTiming",
     "FsmnVadModel",
     "FsmnVadStream",
     "VadDetection",

@@ -77,6 +77,35 @@ class VadDetection:
     """Timing breakdown."""
 
 
+class FireRedVadTiming:
+    """Timing breakdown for a timed FireRedVAD run."""
+
+    frontend_seconds: float
+    """Feature extraction time in seconds."""
+
+    forward_seconds: float
+    """Burn forward pass time in seconds."""
+
+    postprocess_seconds: float
+    """Segmentation post-processing time in seconds."""
+
+    frames: int
+    """Number of acoustic frames processed."""
+
+
+class FireRedVadDetection:
+    """Timed FireRedVAD detection result."""
+
+    segments: list[VadSegment]
+    """Detected speech segments."""
+
+    frame_scores: list[float]
+    """Per-frame speech probabilities."""
+
+    timing: FireRedVadTiming
+    """Timing breakdown."""
+
+
 class FsmnVadStream:
     """Stateful streaming FSMN VAD session."""
 
@@ -145,4 +174,50 @@ class FsmnVadModel:
 
     def new_stream(self, options: Optional[VadOptions] = None) -> FsmnVadStream:
         """Create a stateful streaming VAD session from this loaded model."""
+        ...
+
+
+class FireRedVadModel:
+    """FireRedVAD model implemented with Burn Flex."""
+
+    def __init__(self, model_dir: str) -> None:
+        """Load a local FireRedVAD VAD directory containing model.pth.tar and cmvn.ark."""
+        ...
+
+    @staticmethod
+    def from_pretrained(model_dir: str) -> FireRedVadModel:
+        """Load a local FireRedVAD VAD directory containing model.pth.tar and cmvn.ark."""
+        ...
+
+    @staticmethod
+    def from_modelscope(
+        repo_id: Optional[str] = None,
+        revision: Optional[str] = None,
+    ) -> FireRedVadModel:
+        """Download through ModelScope cache and load FireRedVAD.
+
+        Defaults to repo_id "xukaituo/FireRedVAD" and revision "master".
+        The model files are loaded from the VAD subdirectory.
+        """
+        ...
+
+    def detect(
+        self,
+        samples: Sequence[float],
+        sample_rate: int,
+        options: Optional[VadOptions] = None,
+    ) -> list[VadSegment]:
+        """Run offline FireRedVAD on mono normalized float PCM samples.
+
+        sample_rate must be 16000.
+        """
+        ...
+
+    def detect_with_timing(
+        self,
+        samples: Sequence[float],
+        sample_rate: int,
+        options: Optional[VadOptions] = None,
+    ) -> FireRedVadDetection:
+        """Run offline FireRedVAD and return segments, frame scores, and timing."""
         ...
