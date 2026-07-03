@@ -137,14 +137,10 @@ fn detect_streaming(
     let mut offset = 0usize;
     while offset < waveform.samples.len() {
         let end = (offset + chunk_samples).min(waveform.samples.len());
-        let is_final = end >= waveform.samples.len();
-        segments.extend(stream.accept(
-            &waveform.samples[offset..end],
-            waveform.sample_rate,
-            is_final,
-        )?);
+        segments.extend(stream.push(&waveform.samples[offset..end], waveform.sample_rate)?);
         offset = end;
     }
+    segments.extend(stream.finish()?);
     Ok(segments)
 }
 

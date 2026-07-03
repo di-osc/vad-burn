@@ -29,12 +29,12 @@ let segments = model.detect(&waveform, &VadOptions::default())?;
 
 ```rust
 let mut stream = model.stream(VadOptions::default());
-let chunk_count = chunks.len();
 
-for (idx, chunk) in chunks.iter().enumerate() {
-    let is_final = idx + 1 == chunk_count;
-    let segments = stream.accept(chunk, 16_000, is_final)?;
+for chunk in chunks {
+    let segments = stream.push(chunk, 16_000)?;
 }
+
+let final_segments = stream.finish()?;
 ```
 
 ## Python 用法
@@ -51,6 +51,17 @@ segments = vad.detect(samples, 16000, VadOptions())
 
 for segment in segments:
     print(segment.start_ms, segment.end_ms, segment.probability)
+```
+
+流式推理：
+
+```python
+stream = vad.stream(VadOptions())
+
+for chunk in chunks:
+    segments = stream.push(chunk, 16000)
+
+final_segments = stream.finish()
 ```
 
 `samples` 为归一化到 `[-1.0, 1.0]` 的 `float` PCM 样本，采样率需为 `16000`。

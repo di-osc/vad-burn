@@ -1,7 +1,8 @@
 use pyo3::prelude::*;
 
 use crate::{
-    BurnFsmnVadDetection, BurnFsmnVadModel, BurnFsmnVadTiming, VadOptions, VadSegment, Waveform,
+    BurnFsmnVadDetection, BurnFsmnVadModel, BurnFsmnVadStream, BurnFsmnVadTiming, VadOptions,
+    VadSegment, Waveform,
 };
 
 #[pyclass(name = "VadOptions")]
@@ -120,6 +121,11 @@ pub struct PyFsmnVad {
     inner: BurnFsmnVadModel,
 }
 
+#[pyclass(name = "FsmnVadStream")]
+pub struct PyFsmnVadStream {
+    inner: BurnFsmnVadStream,
+}
+
 #[pymethods]
 impl PyFsmnVad {
     #[new]
@@ -160,11 +166,39 @@ impl PyFsmnVad {
         let waveform = Waveform::new(samples, sample_rate);
         Ok(self.inner.detect_with_timing(&waveform, &options)?.into())
     }
+
+    fn stream(&self, options: Option<&PyVadOptions>) -> PyFsmnVadStream {
+        let options = options.map_or_else(VadOptions::default, Into::into);
+        PyFsmnVadStream {
+            inner: self.inner.stream(options),
+        }
+    }
+}
+
+#[pymethods]
+impl PyFsmnVadStream {
+    fn push(&mut self, samples: Vec<f32>, sample_rate: u32) -> PyResult<Vec<PyVadSegment>> {
+        Ok(self
+            .inner
+            .push(&samples, sample_rate)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    fn finish(&mut self) -> PyResult<Vec<PyVadSegment>> {
+        Ok(self.inner.finish()?.into_iter().map(Into::into).collect())
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
 }
 
 #[pymodule]
 fn vad_burn(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFsmnVad>()?;
+    m.add_class::<PyFsmnVadStream>()?;
     m.add_class::<PyVadOptions>()?;
     m.add_class::<PyVadSegment>()?;
     m.add_class::<PyVadTiming>()?;

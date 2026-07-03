@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
@@ -23,12 +24,13 @@ pub struct BurnFsmnVadDetection {
 pub struct BurnFsmnVadModel {
     frontend: FsmnVadFrontend,
     post_processor: FsmnVadPostProcessor,
-    weights: BurnFsmnWeights,
+    weights: Arc<BurnFsmnWeights>,
     model_dir: PathBuf,
 }
 
-pub struct BurnFsmnVadStream<'model> {
-    model: &'model BurnFsmnVadModel,
+pub struct BurnFsmnVadStream {
+    frontend: FsmnVadFrontend,
+    weights: Arc<BurnFsmnWeights>,
     options: VadOptions,
     caches: Vec<Tensor<Backend, 2>>,
     post_processor: FsmnVadStreamingPostProcessor,
@@ -45,7 +47,7 @@ impl BurnFsmnVadModel {
         Ok(Self {
             frontend,
             post_processor: FsmnVadPostProcessor,
-            weights,
+            weights: Arc::new(weights),
             model_dir,
         })
     }
@@ -71,9 +73,10 @@ impl BurnFsmnVadModel {
         Ok((scores, timing))
     }
 
-    pub fn stream(&self, options: VadOptions) -> BurnFsmnVadStream<'_> {
+    pub fn stream(&self, options: VadOptions) -> BurnFsmnVadStream {
         BurnFsmnVadStream {
-            model: self,
+            frontend: self.frontend.clone(),
+            weights: Arc::clone(&self.weights),
             caches: self.weights.zero_caches(),
             post_processor: FsmnVadStreamingPostProcessor::new(options.clone()),
             options,
@@ -166,8 +169,16 @@ impl BurnFsmnVadModel {
     }
 }
 
-impl BurnFsmnVadStream<'_> {
-    pub fn accept(
+impl BurnFsmnVadStream {
+    pub fn push(&mut self, samples: &[f32], sample_rate: u32) -> Result<Vec<VadSegment>> {
+        self.process_chunk(samples, sample_rate, false)
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<VadSegment>> {
+        self.process_chunk(&[], SAMPLE_RATE, true)
+    }
+
+    fn process_chunk(
         &mut self,
         samples: &[f32],
         sample_rate: u32,
@@ -178,7 +189,6 @@ impl BurnFsmnVadStream<'_> {
 
         self.samples.extend_from_slice(samples);
         let feats = self
-            .model
             .frontend
             .extract_features_from_normalized_f32(&self.samples)?;
         let [frames, feat_dim] = feats.dims();
@@ -188,8 +198,7 @@ impl BurnFsmnVadStream<'_> {
         let frame_scores = if frames > self.processed_frames {
             let feats = feats.slice([self.processed_frames..frames, 0..FEAT_DIM]);
             self.processed_frames = frames;
-            self.model
-                .weights
+            self.weights
                 .forward_frame_scores_streaming(feats, &mut self.caches)?
         } else {
             Vec::new()
@@ -215,7 +224,7 @@ impl BurnFsmnVadStream<'_> {
     }
 
     pub fn reset(&mut self) {
-        self.caches = self.model.weights.zero_caches();
+        self.caches = self.weights.zero_caches();
         self.post_processor = FsmnVadStreamingPostProcessor::new(self.options.clone());
         self.samples.clear();
         self.processed_frames = 0;
