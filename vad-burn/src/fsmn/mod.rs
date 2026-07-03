@@ -7,5 +7,8 @@ mod post;
 mod timing;
 mod weights;
 
-pub use model::{FeatureTensor, FsmnVadDetection, FsmnVadModel, FsmnVadStream};
+pub use model::{
+    DEFAULT_MODELSCOPE_REPO_ID, DEFAULT_MODELSCOPE_REVISION, FeatureTensor, FsmnVadDetection,
+    FsmnVadModel, FsmnVadStream,
+};
 pub use timing::{FsmnForwardTiming, FsmnVadTiming};

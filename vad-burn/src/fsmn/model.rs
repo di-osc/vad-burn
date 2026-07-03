@@ -14,6 +14,9 @@ use crate::{VadOptions, VadSegment, Waveform};
 
 pub type FeatureTensor = Tensor<Backend, 2>;
 
+pub const DEFAULT_MODELSCOPE_REPO_ID: &str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch";
+pub const DEFAULT_MODELSCOPE_REVISION: &str = "master";
+
 #[derive(Debug, Clone)]
 pub struct FsmnVadDetection {
     pub segments: Vec<VadSegment>,
@@ -36,6 +39,8 @@ pub struct FsmnVadStream {
     post_processor: FsmnVadStreamingPostProcessor,
     samples: Vec<f32>,
     processed_frames: usize,
+    pending_samples: Vec<f32>,
+    pending_frame_scores: Vec<Vec<f32>>,
     frame_scores: Vec<Vec<f32>>,
 }
 
@@ -50,6 +55,29 @@ impl FsmnVadModel {
             weights: Arc::new(weights),
             model_dir,
         })
+    }
+
+    pub fn from_modelscope() -> Result<Self> {
+        Self::from_modelscope_revision(DEFAULT_MODELSCOPE_REPO_ID, DEFAULT_MODELSCOPE_REVISION)
+    }
+
+    pub fn from_modelscope_revision(repo_id: &str, revision: &str) -> Result<Self> {
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(Self::from_modelscope_revision_async(repo_id, revision))
+    }
+
+    pub async fn from_modelscope_async() -> Result<Self> {
+        Self::from_modelscope_revision_async(
+            DEFAULT_MODELSCOPE_REPO_ID,
+            DEFAULT_MODELSCOPE_REVISION,
+        )
+        .await
+    }
+
+    pub async fn from_modelscope_revision_async(repo_id: &str, revision: &str) -> Result<Self> {
+        let cache_dir = modelhub::modelscope::cache_dir();
+        modelhub::modelscope::download_model_revision(repo_id, revision, &cache_dir).await?;
+        Self::from_pretrained(modelscope_snapshot_dir(&cache_dir, repo_id, revision))
     }
 
     pub fn model_dir(&self) -> &Path {
@@ -82,6 +110,8 @@ impl FsmnVadModel {
             options,
             samples: Vec::new(),
             processed_frames: 0,
+            pending_samples: Vec::new(),
+            pending_frame_scores: Vec::new(),
             frame_scores: Vec::new(),
         }
     }
@@ -169,21 +199,46 @@ impl FsmnVadModel {
     }
 }
 
+fn modelscope_snapshot_dir(cache_dir: &Path, repo_id: &str, revision: &str) -> PathBuf {
+    cache_dir
+        .join("models")
+        .join(repo_id.replace('/', "--"))
+        .join("snapshots")
+        .join(revision)
+}
+
 impl FsmnVadStream {
     pub fn push(&mut self, samples: &[f32], sample_rate: u32) -> Result<Vec<VadSegment>> {
-        self.process_chunk(samples, sample_rate, false)
+        let frame_scores = self.next_frame_scores(samples, sample_rate)?;
+        let segments = if self.pending_frame_scores.is_empty() {
+            Vec::new()
+        } else {
+            self.post_processor.detect_chunk(
+                &self.pending_samples,
+                &self.pending_frame_scores,
+                false,
+            )
+        };
+        self.pending_samples = samples.to_vec();
+        self.pending_frame_scores = frame_scores;
+        Ok(segments)
     }
 
     pub fn finish(&mut self) -> Result<Vec<VadSegment>> {
-        self.process_chunk(&[], SAMPLE_RATE, true)
+        let segments = if self.pending_frame_scores.is_empty() {
+            Vec::new()
+        } else {
+            self.post_processor.detect_chunk(
+                &self.pending_samples,
+                &self.pending_frame_scores,
+                true,
+            )
+        };
+        self.reset();
+        Ok(segments)
     }
 
-    fn process_chunk(
-        &mut self,
-        samples: &[f32],
-        sample_rate: u32,
-        is_final: bool,
-    ) -> Result<Vec<VadSegment>> {
+    fn next_frame_scores(&mut self, samples: &[f32], sample_rate: u32) -> Result<Vec<Vec<f32>>> {
         let waveform = Waveform::new(samples.to_vec(), sample_rate);
         validate_waveform(&waveform)?;
 
@@ -203,16 +258,8 @@ impl FsmnVadStream {
         } else {
             Vec::new()
         };
-        let segments = self
-            .post_processor
-            .detect_chunk(samples, &frame_scores, is_final);
-        self.frame_scores.extend(frame_scores);
-
-        if is_final {
-            self.reset();
-        }
-
-        Ok(segments)
+        self.frame_scores.extend(frame_scores.clone());
+        Ok(frame_scores)
     }
 
     pub fn frame_scores(&self) -> &[Vec<f32>] {
@@ -228,6 +275,8 @@ impl FsmnVadStream {
         self.post_processor = FsmnVadStreamingPostProcessor::new(self.options.clone());
         self.samples.clear();
         self.processed_frames = 0;
+        self.pending_samples.clear();
+        self.pending_frame_scores.clear();
         self.frame_scores.clear();
     }
 }

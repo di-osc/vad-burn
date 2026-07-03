@@ -139,6 +139,16 @@ impl PyFsmnVadModel {
         Self::new(model_dir)
     }
 
+    #[staticmethod]
+    #[pyo3(signature = (repo_id=None, revision=None))]
+    fn from_modelscope(repo_id: Option<&str>, revision: Option<&str>) -> PyResult<Self> {
+        let inner = FsmnVadModel::from_modelscope_revision(
+            repo_id.unwrap_or(crate::DEFAULT_MODELSCOPE_REPO_ID),
+            revision.unwrap_or(crate::DEFAULT_MODELSCOPE_REVISION),
+        )?;
+        Ok(Self { inner })
+    }
+
     fn detect(
         &self,
         samples: Vec<f32>,

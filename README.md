@@ -20,9 +20,15 @@ vad-burn = "0.1"
 ```rust
 use vad_burn::{FsmnVadModel, VadOptions, Waveform};
 
-let model = FsmnVadModel::from_pretrained("/path/to/fsmn-vad")?;
+let model = FsmnVadModel::from_modelscope()?;
 let waveform = Waveform::new(samples, 16_000);
 let segments = model.detect(&waveform, &VadOptions::default())?;
+```
+
+默认会从 ModelScope 下载并缓存 `iic/speech_fsmn_vad_zh-cn-16k-common-pytorch@master`。也可以加载本地模型目录：
+
+```rust
+let model = FsmnVadModel::from_pretrained("/path/to/fsmn-vad")?;
 ```
 
 流式推理：
@@ -46,7 +52,7 @@ pip install vad-burn
 ```python
 from vad_burn import FsmnVadModel, VadOptions
 
-vad = FsmnVadModel.from_pretrained("/path/to/fsmn-vad")
+vad = FsmnVadModel.from_modelscope()
 segments = vad.detect(samples, 16000, VadOptions())
 
 for segment in segments:
@@ -73,7 +79,6 @@ final_segments = stream.finish()
 ```bash
 cargo run --release -p vad-burn --example bench_fsmn_vad -- \
   --audio assets/vad_example.wav \
-  --model /path/to/fsmn-vad \
   --warmup 2 \
   --repeat 10 \
   --stream-chunk-ms 600

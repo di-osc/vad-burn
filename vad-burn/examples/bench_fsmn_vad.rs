@@ -12,7 +12,11 @@ fn main() -> Result<()> {
     }
 
     let options = VadOptions::default();
-    let burn = FsmnVadModel::from_pretrained(&args.model)?;
+    let burn = if let Some(model) = &args.model {
+        FsmnVadModel::from_pretrained(model)?
+    } else {
+        FsmnVadModel::from_modelscope()?
+    };
 
     for _ in 0..args.warmup {
         let _ = burn.detect(&waveform, &options)?;
@@ -167,7 +171,7 @@ fn average_forward_ops(timings: &[vad_burn::FsmnVadTiming]) -> FsmnForwardTiming
 
 struct Args {
     audio: PathBuf,
-    model: PathBuf,
+    model: Option<PathBuf>,
     warmup: usize,
     repeat: usize,
     stream_chunk_ms: u64,
@@ -176,7 +180,7 @@ struct Args {
 impl Args {
     fn parse() -> Result<Self> {
         let mut audio = PathBuf::from("assets/vad_example.wav");
-        let mut model = None;
+        let mut model = default_model_path();
         let mut warmup = 1usize;
         let mut repeat = 5usize;
         let mut stream_chunk_ms = 600u64;
@@ -190,7 +194,7 @@ impl Args {
                 "--stream-chunk-ms" => stream_chunk_ms = next_u64(&mut args, "--stream-chunk-ms")?,
                 "-h" | "--help" => {
                     println!(
-                        "Usage: cargo run -p vad-burn --example bench_fsmn_vad -- --audio WAV --model MODEL_DIR [--stream-chunk-ms 600]"
+                        "Usage: cargo run -p vad-burn --example bench_fsmn_vad -- --audio WAV [--model MODEL_DIR] [--stream-chunk-ms 600]"
                     );
                     std::process::exit(0);
                 }
@@ -201,9 +205,6 @@ impl Args {
         if repeat == 0 {
             bail!("--repeat must be greater than zero");
         }
-        let model = model
-            .or_else(default_model_path)
-            .ok_or_else(|| anyhow::anyhow!("pass --model PATH to fsmn-vad model dir"))?;
         Ok(Self {
             audio,
             model,
