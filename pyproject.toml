@@ -12,7 +12,7 @@ classifiers = [
 dynamic = ["version"]
 
 [tool.maturin]
-manifest-path = "vad-burn/Cargo.toml"
+manifest-path = "Cargo.toml"
 features = ["extension-module"]
 module-name = "vad_burn.vad_burn"
 python-source = "python"
