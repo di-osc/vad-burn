@@ -980,11 +980,6 @@ struct FireRedStreamVadPostprocessor {
 impl FireRedStreamVadPostprocessor {
     fn from_options(options: &VadOptions) -> Self {
         let smooth_window_size = STREAM_DEFAULT_SMOOTH_WINDOW_SIZE;
-        let pad_start_frame = if options.pad_ms > 0 {
-            ms_to_frame_count(options.pad_ms)
-        } else {
-            STREAM_DEFAULT_PAD_START_FRAME
-        };
         Self {
             smooth_window_size,
             speech_threshold: if options.threshold > 0.0 {
@@ -992,7 +987,7 @@ impl FireRedStreamVadPostprocessor {
             } else {
                 0.5
             },
-            pad_start_frame: pad_start_frame.max(smooth_window_size),
+            pad_start_frame: STREAM_DEFAULT_PAD_START_FRAME,
             min_speech_frame: ms_to_frame_count(options.min_speech_ms),
             max_speech_frame: if options.max_segment_ms > 0 {
                 ms_to_frame_count(options.max_segment_ms)
