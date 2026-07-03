@@ -1,6 +1,9 @@
 name: Release
 
 on:
+  push:
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -34,7 +37,11 @@ jobs:
         id: tag
         shell: bash
         run: |
-          tag="${{ inputs.tag }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
           git fetch --tags origin
           if ! git rev-parse "$tag" >/dev/null 2>&1; then
             git tag "$tag"
@@ -80,7 +87,7 @@ jobs:
 
   publish-pypi:
     name: Publish PyPI
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    if: github.event_name == 'push' || inputs.publish
     needs: github-release
     runs-on: ubuntu-latest
     environment: pypi
@@ -97,7 +104,7 @@ jobs:
 
   publish-crates:
     name: Publish crates.io
-    if: github.event_name == 'workflow_dispatch' && inputs.publish_crates
+    if: github.event_name == 'push' || inputs.publish_crates
     needs: github-release
     runs-on: ubuntu-latest
     environment: crates-io

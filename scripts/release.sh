@@ -3,16 +3,14 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/release.sh v0.1.0 [options]
+Usage: scripts/release.sh v0.1.1 [options]
 
-Trigger the GitHub Release workflow. By default it publishes the GitHub
-Release, PyPI wheels, and crates.io crates from the selected ref.
+Create and push a release tag. Pushing v*.*.* triggers the GitHub Release
+workflow, which builds wheels and publishes GitHub Release, PyPI, and crates.io.
 
 Options:
-  --ref REF          Git ref to run the workflow from (default: current branch)
-  --no-pypi         Do not publish to PyPI
-  --no-crates       Do not publish to crates.io
-  --watch           Watch the GitHub Actions run until completion
+  --ref REF          Git ref to tag (default: HEAD)
+  --watch           Watch the run with gh when gh is installed
   -h, --help        Show this help
 EOF
 }
@@ -28,9 +26,7 @@ if [[ $# -lt 1 ]]; then
 fi
 
 tag="$1"
-ref="$(git branch --show-current)"
-publish_pypi=true
-publish_crates=true
+ref="HEAD"
 watch=false
 shift
 
@@ -43,12 +39,6 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       shift
-      ;;
-    --no-pypi)
-      publish_pypi=false
-      ;;
-    --no-crates)
-      publish_crates=false
       ;;
     --watch)
       watch=true
@@ -66,25 +56,22 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-if [[ -z "$ref" ]]; then
-  echo "could not determine the current branch; pass --ref REF" >&2
-  exit 2
+git fetch --tags origin
+
+if git rev-parse "$tag" >/dev/null 2>&1; then
+  echo "tag $tag already exists locally"
+else
+  git tag "$tag" "$ref"
 fi
 
-if ! command -v gh >/dev/null 2>&1; then
-  echo "gh is required: https://cli.github.com/" >&2
-  exit 1
-fi
-
-gh workflow run release.yml \
-  --ref "$ref" \
-  --field "tag=$tag" \
-  --field "publish=$publish_pypi" \
-  --field "publish_crates=$publish_crates"
-
-echo "Triggered release workflow for $tag on $ref"
+git push origin "$tag"
+echo "Pushed $tag. GitHub Actions will run the Release workflow."
 
 if [[ "$watch" == true ]]; then
-  sleep 3
-  gh run watch "$(gh run list --workflow release.yml --branch "$ref" --limit 1 --json databaseId --jq '.[0].databaseId')"
+  if command -v gh >/dev/null 2>&1; then
+    sleep 5
+    gh run watch "$(gh run list --workflow release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+  else
+    echo "gh is not installed; watch the run at https://github.com/di-osc/vad-burn/actions/workflows/release.yml"
+  fi
 fi
