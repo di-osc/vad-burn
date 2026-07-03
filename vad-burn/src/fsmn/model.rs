@@ -8,27 +8,27 @@ use burn::tensor::Tensor;
 use super::constants::{Backend, FEAT_DIM, SAMPLE_RATE};
 use super::frontend::FsmnVadFrontend;
 use super::post::{FsmnVadPostProcessor, FsmnVadStreamingPostProcessor};
-use super::timing::{BurnFsmnForwardTiming, BurnFsmnVadTiming};
+use super::timing::{FsmnForwardTiming, FsmnVadTiming};
 use super::weights::BurnFsmnWeights;
 use crate::{VadOptions, VadSegment, Waveform};
 
-pub type BurnFeatureTensor = Tensor<Backend, 2>;
+pub type FeatureTensor = Tensor<Backend, 2>;
 
 #[derive(Debug, Clone)]
-pub struct BurnFsmnVadDetection {
+pub struct FsmnVadDetection {
     pub segments: Vec<VadSegment>,
     pub frame_scores: Vec<Vec<f32>>,
-    pub timing: BurnFsmnVadTiming,
+    pub timing: FsmnVadTiming,
 }
 
-pub struct BurnFsmnVadModel {
+pub struct FsmnVadModel {
     frontend: FsmnVadFrontend,
     post_processor: FsmnVadPostProcessor,
     weights: Arc<BurnFsmnWeights>,
     model_dir: PathBuf,
 }
 
-pub struct BurnFsmnVadStream {
+pub struct FsmnVadStream {
     frontend: FsmnVadFrontend,
     weights: Arc<BurnFsmnWeights>,
     options: VadOptions,
@@ -39,7 +39,7 @@ pub struct BurnFsmnVadStream {
     frame_scores: Vec<Vec<f32>>,
 }
 
-impl BurnFsmnVadModel {
+impl FsmnVadModel {
     pub fn from_pretrained(model_dir: impl AsRef<Path>) -> Result<Self> {
         let model_dir = model_dir.as_ref().to_path_buf();
         let frontend = FsmnVadFrontend::new(&model_dir)?;
@@ -56,25 +56,25 @@ impl BurnFsmnVadModel {
         &self.model_dir
     }
 
-    pub fn forward_frame_scores(&self, feats: BurnFeatureTensor) -> Result<Vec<Vec<f32>>> {
+    pub fn forward_frame_scores(&self, feats: FeatureTensor) -> Result<Vec<Vec<f32>>> {
         let mut caches = self.weights.zero_caches();
         self.weights.forward_frame_scores(feats, &mut caches)
     }
 
     pub fn forward_frame_scores_with_timing(
         &self,
-        feats: BurnFeatureTensor,
-    ) -> Result<(Vec<Vec<f32>>, BurnFsmnForwardTiming)> {
+        feats: FeatureTensor,
+    ) -> Result<(Vec<Vec<f32>>, FsmnForwardTiming)> {
         let mut caches = self.weights.zero_caches();
-        let mut timing = BurnFsmnForwardTiming::default();
+        let mut timing = FsmnForwardTiming::default();
         let scores =
             self.weights
                 .forward_frame_scores_with_timing(feats, &mut caches, &mut timing)?;
         Ok((scores, timing))
     }
 
-    pub fn stream(&self, options: VadOptions) -> BurnFsmnVadStream {
-        BurnFsmnVadStream {
+    pub fn new_stream(&self, options: VadOptions) -> FsmnVadStream {
+        FsmnVadStream {
             frontend: self.frontend.clone(),
             weights: Arc::clone(&self.weights),
             caches: self.weights.zero_caches(),
@@ -90,10 +90,10 @@ impl BurnFsmnVadModel {
         &self,
         waveform: &Waveform,
         options: &VadOptions,
-    ) -> Result<BurnFsmnVadDetection> {
+    ) -> Result<FsmnVadDetection> {
         validate_waveform(waveform)?;
 
-        let mut timing = BurnFsmnVadTiming::default();
+        let mut timing = FsmnVadTiming::default();
         let frontend_start = Instant::now();
         let feats = self
             .frontend
@@ -116,7 +116,7 @@ impl BurnFsmnVadModel {
         )?;
         timing.segmenter_seconds = segment_start.elapsed().as_secs_f64();
 
-        Ok(BurnFsmnVadDetection {
+        Ok(FsmnVadDetection {
             segments,
             frame_scores,
             timing,
@@ -169,7 +169,7 @@ impl BurnFsmnVadModel {
     }
 }
 
-impl BurnFsmnVadStream {
+impl FsmnVadStream {
     pub fn push(&mut self, samples: &[f32], sample_rate: u32) -> Result<Vec<VadSegment>> {
         self.process_chunk(samples, sample_rate, false)
     }
@@ -266,7 +266,7 @@ mod tests {
         }
         let waveform = load_pcm16_wav(&audio)?.slice_ms(0, 12_000);
         let options = VadOptions::default();
-        let burn = BurnFsmnVadModel::from_pretrained(model_dir)?;
+        let burn = FsmnVadModel::from_pretrained(model_dir)?;
 
         let detection = burn.detect_with_timing(&waveform, &options)?;
         assert!(!detection.frame_scores.is_empty());

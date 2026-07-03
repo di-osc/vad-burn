@@ -18,9 +18,9 @@ vad-burn = "0.1"
 ```
 
 ```rust
-use vad_burn::{BurnFsmnVadModel, VadOptions, Waveform};
+use vad_burn::{FsmnVadModel, VadOptions, Waveform};
 
-let model = BurnFsmnVadModel::from_pretrained("/path/to/fsmn-vad")?;
+let model = FsmnVadModel::from_pretrained("/path/to/fsmn-vad")?;
 let waveform = Waveform::new(samples, 16_000);
 let segments = model.detect(&waveform, &VadOptions::default())?;
 ```
@@ -28,7 +28,7 @@ let segments = model.detect(&waveform, &VadOptions::default())?;
 流式推理：
 
 ```rust
-let mut stream = model.stream(VadOptions::default());
+let mut stream = model.new_stream(VadOptions::default());
 
 for chunk in chunks {
     let segments = stream.push(chunk, 16_000)?;
@@ -44,9 +44,9 @@ pip install vad-burn
 ```
 
 ```python
-from vad_burn import FsmnVad, VadOptions
+from vad_burn import FsmnVadModel, VadOptions
 
-vad = FsmnVad.from_pretrained("/path/to/fsmn-vad")
+vad = FsmnVadModel.from_pretrained("/path/to/fsmn-vad")
 segments = vad.detect(samples, 16000, VadOptions())
 
 for segment in segments:
@@ -56,7 +56,7 @@ for segment in segments:
 流式推理：
 
 ```python
-stream = vad.stream(VadOptions())
+stream = vad.new_stream(VadOptions())
 
 for chunk in chunks:
     segments = stream.push(chunk, 16000)

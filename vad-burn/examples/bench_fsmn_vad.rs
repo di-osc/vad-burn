@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use vad_burn::{BurnFsmnForwardTiming, BurnFsmnVadModel, VadOptions, Waveform};
+use vad_burn::{FsmnForwardTiming, FsmnVadModel, VadOptions, Waveform};
 
 fn main() -> Result<()> {
     let args = Args::parse()?;
@@ -12,7 +12,7 @@ fn main() -> Result<()> {
     }
 
     let options = VadOptions::default();
-    let burn = BurnFsmnVadModel::from_pretrained(&args.model)?;
+    let burn = FsmnVadModel::from_pretrained(&args.model)?;
 
     for _ in 0..args.warmup {
         let _ = burn.detect(&waveform, &options)?;
@@ -126,12 +126,12 @@ fn main() -> Result<()> {
 }
 
 fn detect_streaming(
-    model: &BurnFsmnVadModel,
+    model: &FsmnVadModel,
     waveform: &Waveform,
     options: &VadOptions,
     chunk_ms: u64,
 ) -> Result<Vec<vad_burn::VadSegment>> {
-    let mut stream = model.stream(options.clone());
+    let mut stream = model.new_stream(options.clone());
     let chunk_samples = ((waveform.sample_rate as u64 * chunk_ms) / 1000).max(1) as usize;
     let mut segments = Vec::new();
     let mut offset = 0usize;
@@ -144,9 +144,9 @@ fn detect_streaming(
     Ok(segments)
 }
 
-fn average_forward_ops(timings: &[vad_burn::BurnFsmnVadTiming]) -> BurnFsmnForwardTiming {
+fn average_forward_ops(timings: &[vad_burn::FsmnVadTiming]) -> FsmnForwardTiming {
     let count = timings.len() as f64;
-    let mut avg = BurnFsmnForwardTiming::default();
+    let mut avg = FsmnForwardTiming::default();
     for timing in timings {
         let ops = timing.forward_ops;
         avg.input_tensor_seconds += ops.input_tensor_seconds / count;

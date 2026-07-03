@@ -7,5 +7,5 @@ mod post;
 mod timing;
 mod weights;
 
-pub use model::{BurnFeatureTensor, BurnFsmnVadDetection, BurnFsmnVadModel, BurnFsmnVadStream};
-pub use timing::{BurnFsmnForwardTiming, BurnFsmnVadTiming};
+pub use model::{FeatureTensor, FsmnVadDetection, FsmnVadModel, FsmnVadStream};
+pub use timing::{FsmnForwardTiming, FsmnVadTiming};

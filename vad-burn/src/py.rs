@@ -1,8 +1,7 @@
 use pyo3::prelude::*;
 
 use crate::{
-    BurnFsmnVadDetection, BurnFsmnVadModel, BurnFsmnVadStream, BurnFsmnVadTiming, VadOptions,
-    VadSegment, Waveform,
+    FsmnVadDetection, FsmnVadModel, FsmnVadStream, FsmnVadTiming, VadOptions, VadSegment, Waveform,
 };
 
 #[pyclass(name = "VadOptions")]
@@ -85,8 +84,8 @@ pub struct PyVadTiming {
     pub segmenter_seconds: f64,
 }
 
-impl From<BurnFsmnVadTiming> for PyVadTiming {
-    fn from(timing: BurnFsmnVadTiming) -> Self {
+impl From<FsmnVadTiming> for PyVadTiming {
+    fn from(timing: FsmnVadTiming) -> Self {
         Self {
             frontend_seconds: timing.frontend_seconds,
             forward_seconds: timing.forward_seconds,
@@ -106,8 +105,8 @@ pub struct PyVadDetection {
     pub timing: PyVadTiming,
 }
 
-impl From<BurnFsmnVadDetection> for PyVadDetection {
-    fn from(detection: BurnFsmnVadDetection) -> Self {
+impl From<FsmnVadDetection> for PyVadDetection {
+    fn from(detection: FsmnVadDetection) -> Self {
         Self {
             segments: detection.segments.into_iter().map(Into::into).collect(),
             frame_scores: detection.frame_scores,
@@ -116,22 +115,22 @@ impl From<BurnFsmnVadDetection> for PyVadDetection {
     }
 }
 
-#[pyclass(name = "FsmnVad")]
-pub struct PyFsmnVad {
-    inner: BurnFsmnVadModel,
+#[pyclass(name = "FsmnVadModel")]
+pub struct PyFsmnVadModel {
+    inner: FsmnVadModel,
 }
 
 #[pyclass(name = "FsmnVadStream")]
 pub struct PyFsmnVadStream {
-    inner: BurnFsmnVadStream,
+    inner: FsmnVadStream,
 }
 
 #[pymethods]
-impl PyFsmnVad {
+impl PyFsmnVadModel {
     #[new]
     fn new(model_dir: &str) -> PyResult<Self> {
         Ok(Self {
-            inner: BurnFsmnVadModel::from_pretrained(model_dir)?,
+            inner: FsmnVadModel::from_pretrained(model_dir)?,
         })
     }
 
@@ -167,10 +166,10 @@ impl PyFsmnVad {
         Ok(self.inner.detect_with_timing(&waveform, &options)?.into())
     }
 
-    fn stream(&self, options: Option<&PyVadOptions>) -> PyFsmnVadStream {
+    fn new_stream(&self, options: Option<&PyVadOptions>) -> PyFsmnVadStream {
         let options = options.map_or_else(VadOptions::default, Into::into);
         PyFsmnVadStream {
-            inner: self.inner.stream(options),
+            inner: self.inner.new_stream(options),
         }
     }
 }
@@ -197,7 +196,7 @@ impl PyFsmnVadStream {
 
 #[pymodule]
 fn vad_burn(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyFsmnVad>()?;
+    m.add_class::<PyFsmnVadModel>()?;
     m.add_class::<PyFsmnVadStream>()?;
     m.add_class::<PyVadOptions>()?;
     m.add_class::<PyVadSegment>()?;

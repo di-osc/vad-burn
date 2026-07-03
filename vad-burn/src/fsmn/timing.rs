@@ -1,15 +1,15 @@
 use super::constants::LAYERS;
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct BurnFsmnVadTiming {
+pub struct FsmnVadTiming {
     pub frontend_seconds: f64,
     pub forward_seconds: f64,
     pub segmenter_seconds: f64,
-    pub forward_ops: BurnFsmnForwardTiming,
+    pub forward_ops: FsmnForwardTiming,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct BurnFsmnForwardTiming {
+pub struct FsmnForwardTiming {
     pub input_tensor_seconds: f64,
     pub in_linear1_seconds: f64,
     pub in_linear2_seconds: f64,

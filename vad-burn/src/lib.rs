@@ -4,7 +4,6 @@ mod py;
 mod types;
 
 pub use fsmn::{
-    BurnFeatureTensor, BurnFsmnForwardTiming, BurnFsmnVadDetection, BurnFsmnVadModel,
-    BurnFsmnVadStream, BurnFsmnVadTiming,
+    FeatureTensor, FsmnForwardTiming, FsmnVadDetection, FsmnVadModel, FsmnVadStream, FsmnVadTiming,
 };
 pub use types::{DurationMs, TimeRange, VadOptions, VadSegment, Waveform};

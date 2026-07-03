@@ -8,14 +8,14 @@ use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
 
-use super::BurnFeatureTensor;
+use super::FeatureTensor;
 
 #[derive(Debug, Clone)]
 pub struct FsmnVadFrontend {
     config: WavFrontendConfig,
     device: FlexDevice,
-    cmvn_means: Option<BurnFeatureTensor>,
-    cmvn_vars: Option<BurnFeatureTensor>,
+    cmvn_means: Option<FeatureTensor>,
+    cmvn_vars: Option<FeatureTensor>,
 }
 
 impl FsmnVadFrontend {
@@ -31,10 +31,7 @@ impl FsmnVadFrontend {
         })
     }
 
-    pub fn extract_features_from_normalized_f32(
-        &self,
-        samples: &[f32],
-    ) -> Result<BurnFeatureTensor> {
+    pub fn extract_features_from_normalized_f32(&self, samples: &[f32]) -> Result<FeatureTensor> {
         let waveform = samples
             .iter()
             .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
@@ -44,7 +41,7 @@ impl FsmnVadFrontend {
         Ok(self.apply_cmvn(lfr))
     }
 
-    fn compute_fbank_features(&self, waveform: &[f32]) -> Result<BurnFeatureTensor> {
+    fn compute_fbank_features(&self, waveform: &[f32]) -> Result<FeatureTensor> {
         let opt = FbankOptions {
             frame_opts: FrameExtractionOptions {
                 samp_freq: self.config.sample_rate as f32,
@@ -78,7 +75,7 @@ impl FsmnVadFrontend {
         ))
     }
 
-    fn apply_lfr(&self, fbank: BurnFeatureTensor) -> BurnFeatureTensor {
+    fn apply_lfr(&self, fbank: FeatureTensor) -> FeatureTensor {
         let [t, _] = fbank.dims();
         let n_mels = self.config.n_mels;
         let feat_dim = n_mels * self.config.lfr_m;
@@ -111,7 +108,7 @@ impl FsmnVadFrontend {
         Tensor::cat(parts, 1)
     }
 
-    fn apply_cmvn(&self, feats: BurnFeatureTensor) -> BurnFeatureTensor {
+    fn apply_cmvn(&self, feats: FeatureTensor) -> FeatureTensor {
         let (Some(means), Some(vars)) = (&self.cmvn_means, &self.cmvn_vars) else {
             return feats;
         };

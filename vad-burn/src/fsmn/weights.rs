@@ -9,12 +9,12 @@ use burn::tensor::{Tensor, TensorData};
 use burn_store::pytorch::PytorchReader;
 
 use super::constants::{Backend, CACHE_FRAMES, FEAT_DIM, LAYERS, PROJ_DIM};
-use super::model::BurnFeatureTensor;
+use super::model::FeatureTensor;
 use super::ops::{
     fsmn_memory, load_conv_left_weight, load_vec, next_cache, silence_posterior, snapshot_shape,
     tensor_rows,
 };
-use super::timing::BurnFsmnForwardTiming;
+use super::timing::FsmnForwardTiming;
 
 pub struct BurnFsmnWeights {
     device: FlexDevice,
@@ -81,7 +81,7 @@ impl BurnFsmnWeights {
 
     pub fn forward_frame_scores(
         &self,
-        feats: BurnFeatureTensor,
+        feats: FeatureTensor,
         caches: &mut [Tensor<Backend, 2>],
     ) -> Result<Vec<Vec<f32>>> {
         self.forward_frame_scores_inner(feats, caches, false)
@@ -89,7 +89,7 @@ impl BurnFsmnWeights {
 
     pub fn forward_frame_scores_streaming(
         &self,
-        feats: BurnFeatureTensor,
+        feats: FeatureTensor,
         caches: &mut [Tensor<Backend, 2>],
     ) -> Result<Vec<Vec<f32>>> {
         self.forward_frame_scores_inner(feats, caches, true)
@@ -97,7 +97,7 @@ impl BurnFsmnWeights {
 
     fn forward_frame_scores_inner(
         &self,
-        feats: BurnFeatureTensor,
+        feats: FeatureTensor,
         caches: &mut [Tensor<Backend, 2>],
         update_caches: bool,
     ) -> Result<Vec<Vec<f32>>> {
@@ -123,9 +123,9 @@ impl BurnFsmnWeights {
 
     pub fn forward_frame_scores_with_timing(
         &self,
-        feats: BurnFeatureTensor,
+        feats: FeatureTensor,
         caches: &mut [Tensor<Backend, 2>],
-        timing: &mut BurnFsmnForwardTiming,
+        timing: &mut FsmnForwardTiming,
     ) -> Result<Vec<Vec<f32>>> {
         let [frames, feat_dim] = feats.dims();
         if feat_dim != FEAT_DIM {
@@ -196,7 +196,7 @@ impl BurnFsmnBlock {
         frames: usize,
         cache: &Tensor<Backend, 2>,
         idx: usize,
-        timing: &mut BurnFsmnForwardTiming,
+        timing: &mut FsmnForwardTiming,
         update_cache: bool,
     ) -> Result<Tensor<Backend, 2>> {
         let start = Instant::now();
