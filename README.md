@@ -153,3 +153,20 @@ cargo run --release -p vad-burn --example bench_fsmn_vad -- \
 | --- | ---: | ---: | ---: |
 | 离线整段 | 75.408 ms | 0.001070 | 934.52x |
 | 流式 600ms chunk | 178.932 ms | 0.002539 | 393.84x |
+
+FireRedVAD 测试命令：
+
+```bash
+cargo run --release -p vad-burn --example bench_firered_vad -- \
+  --audio assets/vad_example.wav \
+  --warmup 2 \
+  --repeat 10 \
+  --stream-chunk-ms 600
+```
+
+FireRedVAD 测试结果：
+
+| 模式 | 平均耗时 | RTF | 加速比 |
+| --- | ---: | ---: | ---: |
+| 离线 VAD | 136.236 ms | 0.001933 | 517.27x |
+| Stream-VAD 600ms chunk | 196.638 ms | 0.002790 | 358.38x |

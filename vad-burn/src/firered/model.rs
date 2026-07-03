@@ -59,7 +59,7 @@ pub struct FireRedVadStream {
     feature_stream: FireRedFeatureStream,
     weights: Arc<FireRedVadWeights>,
     options: VadOptions,
-    caches: Vec<Tensor<Backend, 3>>,
+    caches: Vec<Vec<f32>>,
     postprocessor: FireRedStreamVadPostprocessor,
     frame_scores: Vec<f32>,
 }
@@ -268,8 +268,9 @@ struct FireRedDfsmnBlock {
 }
 
 struct FireRedFsmn {
-    lookback_weight: Tensor<Backend, 3>,
-    lookahead_weight: Option<Tensor<Backend, 3>>,
+    lookback_tensor: Tensor<Backend, 3>,
+    lookahead_tensor: Option<Tensor<Backend, 3>>,
+    lookback_weight: Vec<f32>,
 }
 
 struct BurnLinear {
@@ -355,7 +356,7 @@ impl FireRedVadWeights {
     fn forward_probs_streaming(
         &self,
         feats: Tensor<Backend, 2>,
-        caches: &mut [Tensor<Backend, 3>],
+        caches: &mut [Vec<f32>],
     ) -> Result<Vec<f32>> {
         if caches.len() != self.fsmn_count() {
             bail!(
@@ -394,9 +395,9 @@ impl FireRedVadWeights {
         Ok(data)
     }
 
-    fn zero_caches(&self) -> Vec<Tensor<Backend, 3>> {
+    fn zero_caches(&self) -> Vec<Vec<f32>> {
         (0..self.fsmn_count())
-            .map(|_| Tensor::<Backend, 3>::zeros([1, PROJ_DIM, FSMN_ORDER - 1], &FlexDevice))
+            .map(|_| vec![0.0; PROJ_DIM * (FSMN_ORDER - 1)])
             .collect()
     }
 
@@ -416,7 +417,7 @@ impl FireRedDfsmnBlock {
     fn forward_streaming(
         &self,
         input: Tensor<Backend, 2>,
-        cache: &mut Tensor<Backend, 3>,
+        cache: &mut Vec<f32>,
     ) -> Result<Tensor<Backend, 2>> {
         let residual = input.clone();
         let mut x = self.fc1.forward(input, true)?;
@@ -427,17 +428,14 @@ impl FireRedDfsmnBlock {
 
 impl FireRedFsmn {
     fn load(reader: &PytorchReader, device: &FlexDevice, prefix: &str) -> Result<Self> {
+        let lookback_key = format!("{prefix}.lookback_filter.weight");
+        let lookahead_key = format!("{prefix}.lookahead_filter.weight");
+        let (lookback_tensor, lookback_weight) = load_fsmn_weight(reader, device, &lookback_key)?;
+        let lookahead_tensor = load_optional_fsmn_weight(reader, device, &lookahead_key)?;
         Ok(Self {
-            lookback_weight: load_fsmn_weight(
-                reader,
-                device,
-                &format!("{prefix}.lookback_filter.weight"),
-            )?,
-            lookahead_weight: load_optional_fsmn_weight(
-                reader,
-                device,
-                &format!("{prefix}.lookahead_filter.weight"),
-            )?,
+            lookback_tensor,
+            lookahead_tensor,
+            lookback_weight,
         })
     }
 
@@ -449,7 +447,7 @@ impl FireRedFsmn {
         let x = input.clone().swap_dims(0, 1).reshape([1, PROJ_DIM, frames]);
         let lookback = conv1d(
             x.clone(),
-            self.lookback_weight.clone(),
+            self.lookback_tensor.clone(),
             None,
             ConvOptions::new([1], [FSMN_ORDER - 1], [1], PROJ_DIM),
         );
@@ -459,7 +457,7 @@ impl FireRedFsmn {
             .swap_dims(0, 1);
         let mut memory = input + lookback;
         if frames > 1
-            && let Some(lookahead_weight) = &self.lookahead_weight
+            && let Some(lookahead_tensor) = &self.lookahead_tensor
         {
             let padded = x.pad(
                 (0, FSMN_ORDER, 0, 0),
@@ -468,7 +466,7 @@ impl FireRedFsmn {
             let narrowed = padded.slice([0..1, 0..PROJ_DIM, 1..frames + FSMN_ORDER]);
             let lookahead = conv1d(
                 narrowed,
-                lookahead_weight.clone(),
+                lookahead_tensor.clone(),
                 None,
                 ConvOptions::new([1], [0], [1], PROJ_DIM),
             )
@@ -482,7 +480,7 @@ impl FireRedFsmn {
     fn forward_streaming(
         &self,
         input: Tensor<Backend, 2>,
-        cache: &mut Tensor<Backend, 3>,
+        cache: &mut Vec<f32>,
     ) -> Result<Tensor<Backend, 2>> {
         let [frames, proj_dim] = input.dims();
         if proj_dim != PROJ_DIM {
@@ -491,34 +489,76 @@ impl FireRedFsmn {
                 input.dims()
             );
         }
-        let [batch, cache_dim, cache_frames] = cache.dims();
-        if batch != 1 || cache_dim != PROJ_DIM || cache_frames != FSMN_ORDER - 1 {
+        let cache_frames = FSMN_ORDER - 1;
+        if cache.len() != cache_frames * PROJ_DIM {
             bail!(
-                "unexpected FireRed streaming cache shape: {:?}",
-                cache.dims()
+                "unexpected FireRed streaming cache length: {}, expected {}",
+                cache.len(),
+                cache_frames * PROJ_DIM
             );
         }
-        let x = input.clone().swap_dims(0, 1).reshape([1, PROJ_DIM, frames]);
-        let x_with_cache = Tensor::cat(vec![cache.clone(), x], 2);
-        let total_frames = cache_frames + frames;
-        *cache = x_with_cache.clone().slice([
-            0..1,
-            0..PROJ_DIM,
-            total_frames - cache_frames..total_frames,
-        ]);
-
-        let lookback = conv1d(
-            x_with_cache,
-            self.lookback_weight.clone(),
-            None,
-            ConvOptions::new([1], [FSMN_ORDER - 1], [1], PROJ_DIM),
+        let input_data = input.into_data().convert::<f32>().into_vec::<f32>()?;
+        let mut output = input_data.clone();
+        apply_fsmn_streaming_lookback(
+            &input_data,
+            &mut output,
+            frames,
+            cache,
+            &self.lookback_weight,
         );
-        let lookback = lookback
-            .slice([0..1, 0..PROJ_DIM, cache_frames..total_frames])
-            .reshape([PROJ_DIM, frames])
-            .swap_dims(0, 1);
-        Ok(input + lookback)
+        update_fsmn_cache(&input_data, frames, cache);
+        Ok(Tensor::<Backend, 2>::from_data(
+            TensorData::new(output, [frames, PROJ_DIM]),
+            &FlexDevice,
+        ))
     }
+}
+
+fn apply_fsmn_streaming_lookback(
+    input: &[f32],
+    output: &mut [f32],
+    frames: usize,
+    cache: &[f32],
+    weight: &[f32],
+) {
+    let cache_frames = FSMN_ORDER - 1;
+    for frame in 0..frames {
+        let extended_frame = cache_frames + frame;
+        let output_base = frame * PROJ_DIM;
+        for kernel in 0..FSMN_ORDER {
+            let source_frame = extended_frame + kernel - (FSMN_ORDER - 1);
+            let weight_base = kernel * PROJ_DIM;
+            if source_frame < cache_frames {
+                let cache_base = source_frame * PROJ_DIM;
+                for channel in 0..PROJ_DIM {
+                    output[output_base + channel] +=
+                        weight[weight_base + channel] * cache[cache_base + channel];
+                }
+            } else {
+                let input_base = (source_frame - cache_frames) * PROJ_DIM;
+                for channel in 0..PROJ_DIM {
+                    output[output_base + channel] +=
+                        weight[weight_base + channel] * input[input_base + channel];
+                }
+            }
+        }
+    }
+}
+
+fn update_fsmn_cache(input: &[f32], frames: usize, cache: &mut Vec<f32>) {
+    let cache_frames = FSMN_ORDER - 1;
+    if frames >= cache_frames {
+        let start = (frames - cache_frames) * PROJ_DIM;
+        cache.copy_from_slice(&input[start..start + cache_frames * PROJ_DIM]);
+        return;
+    }
+
+    let keep_old_frames = cache_frames - frames;
+    let mut next = Vec::with_capacity(cache_frames * PROJ_DIM);
+    next.extend_from_slice(&cache[frames * PROJ_DIM..]);
+    next.extend_from_slice(input);
+    debug_assert_eq!(next.len(), keep_old_frames * PROJ_DIM + input.len());
+    *cache = next;
 }
 
 impl BurnLinear {
@@ -1214,14 +1254,21 @@ fn load_fsmn_weight(
     reader: &PytorchReader,
     device: &FlexDevice,
     key: &str,
-) -> Result<Tensor<Backend, 3>> {
+) -> Result<(Tensor<Backend, 3>, Vec<f32>)> {
     let shape = tensor_shape(reader, key)?;
     if shape != [PROJ_DIM, 1, FSMN_ORDER] {
         bail!("{key} must have shape [{PROJ_DIM}, 1, {FSMN_ORDER}], got {shape:?}");
     }
-    Ok(Tensor::<Backend, 3>::from_data(
-        TensorData::new(load_vec(reader, key)?, [PROJ_DIM, 1, FSMN_ORDER]),
-        device,
+    let raw = load_vec(reader, key)?;
+    let mut transposed = vec![0.0; raw.len()];
+    for channel in 0..PROJ_DIM {
+        for kernel in 0..FSMN_ORDER {
+            transposed[kernel * PROJ_DIM + channel] = raw[channel * FSMN_ORDER + kernel];
+        }
+    }
+    Ok((
+        Tensor::<Backend, 3>::from_data(TensorData::new(raw, [PROJ_DIM, 1, FSMN_ORDER]), device),
+        transposed,
     ))
 }
 
@@ -1233,7 +1280,8 @@ fn load_optional_fsmn_weight(
     if reader.get(key).is_none() {
         return Ok(None);
     }
-    load_fsmn_weight(reader, device, key).map(Some)
+    let (tensor, _) = load_fsmn_weight(reader, device, key)?;
+    Ok(Some(tensor))
 }
 
 fn read_kaldi_binary_cmvn(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
