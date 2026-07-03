@@ -59,6 +59,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
       - uses: PyO3/maturin-action@v1
         with:
           command: build
@@ -74,6 +76,68 @@ jobs:
     needs: [prepare-release, build-wheels]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Generate release notes
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          git fetch --force --tags origin
+
+          previous_tag="$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -n 1 || true)"
+          if [[ -n "$previous_tag" ]]; then
+            range="${previous_tag}..${TAG}"
+            changelog="https://github.com/${REPOSITORY}/compare/${previous_tag}...${TAG}"
+          else
+            range="${TAG}"
+            changelog="https://github.com/${REPOSITORY}/commits/${TAG}"
+          fi
+
+          {
+            echo "## What's Changed"
+            echo
+            first_commit="$(git log --no-merges --format=%H -n 1 "$range" || true)"
+            if [[ -n "$first_commit" ]]; then
+              while IFS=$'\t' read -r subject author sha; do
+                echo "- ${subject} by ${author} in [${sha}](https://github.com/${REPOSITORY}/commit/${sha})"
+              done < <(git log --no-merges --reverse --format=$'%s\t%an\t%h' "$range")
+            else
+              echo "- Release ${TAG}"
+            fi
+
+            if [[ -n "$previous_tag" ]]; then
+              mapfile -t new_contributors < <(
+                git log --no-merges --format=$'%ae\t%an' "$range" \
+                  | sort -u \
+                  | while IFS=$'\t' read -r email name; do
+                      if [[ -n "$email" ]] && ! git log --format=%ae "$previous_tag" | grep -Fxq "$email"; then
+                        printf '%s\n' "$name"
+                      fi
+                    done \
+                  | sort -u
+              )
+
+              if [[ "${#new_contributors[@]}" -gt 0 ]]; then
+                echo
+                echo "## New Contributors"
+                echo
+                for name in "${new_contributors[@]}"; do
+                  echo "- ${name} made their first contribution"
+                done
+              fi
+            fi
+
+            echo
+            echo "**Full Changelog**: ${changelog}"
+          } > RELEASE_NOTES.md
+
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
@@ -82,7 +146,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare-release.outputs.tag }}
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
           files: dist/*
 
   publish-pypi:
@@ -105,7 +169,7 @@ jobs:
   publish-crates:
     name: Publish crates.io
     if: github.event_name == 'push' || inputs.publish_crates
-    needs: github-release
+    needs: [prepare-release, github-release]
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
@@ -113,6 +177,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
       - name: Publish vad-burn
         run: cargo publish -p vad-burn
         env:
