@@ -133,7 +133,14 @@ impl FsmnVadFeatureStream {
         self.fbank
             .accept_waveform(self.config.sample_rate as f32, &waveform);
         self.collect_ready_fbank_frames()?;
-        let lfr = self.next_lfr_frames();
+        let lfr = self.next_lfr_frames(false);
+        Ok(apply_cmvn(lfr, &self.cmvn_means, &self.cmvn_vars))
+    }
+
+    pub fn finish(&mut self) -> Result<FeatureTensor> {
+        self.fbank.input_finished();
+        self.collect_ready_fbank_frames()?;
+        let lfr = self.next_lfr_frames(true);
         Ok(apply_cmvn(lfr, &self.cmvn_means, &self.cmvn_vars))
     }
 
@@ -155,7 +162,7 @@ impl FsmnVadFeatureStream {
         Ok(())
     }
 
-    fn next_lfr_frames(&mut self) -> FeatureTensor {
+    fn next_lfr_frames(&mut self, is_final: bool) -> FeatureTensor {
         let fbank_rows = self.fbank_frames.len();
         let n_mels = self.config.n_mels;
         let feat_dim = n_mels * self.config.lfr_m;
@@ -163,7 +170,11 @@ impl FsmnVadFeatureStream {
             return Tensor::<Flex, 2>::zeros([0, feat_dim], &self.device);
         }
 
-        let total_lfr_frames = fbank_rows.div_ceil(self.config.lfr_n);
+        let total_lfr_frames = if is_final {
+            fbank_rows.div_ceil(self.config.lfr_n)
+        } else {
+            self.complete_lfr_frame_count(fbank_rows)
+        };
         if total_lfr_frames <= self.emitted_lfr_frames {
             return Tensor::<Flex, 2>::zeros([0, feat_dim], &self.device);
         }
@@ -186,6 +197,14 @@ impl FsmnVadFeatureStream {
             TensorData::new(out, [new_lfr_frames, feat_dim]),
             &self.device,
         )
+    }
+
+    fn complete_lfr_frame_count(&self, fbank_rows: usize) -> usize {
+        let left_padding_rows = (self.config.lfr_m - 1) / 2;
+        if fbank_rows <= left_padding_rows {
+            return 0;
+        }
+        ((fbank_rows - left_padding_rows - 1) / self.config.lfr_n) + 1
     }
 }
 

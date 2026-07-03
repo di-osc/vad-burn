@@ -223,15 +223,22 @@ impl FsmnVadStream {
     }
 
     pub fn finish(&mut self) -> Result<Vec<VadSegment>> {
-        let segments = if self.pending_frame_scores.is_empty() {
+        let final_frame_scores = self.next_final_frame_scores()?;
+        let mut segments = if self.pending_frame_scores.is_empty() {
             Vec::new()
         } else {
             self.post_processor.detect_chunk(
                 &self.pending_samples,
                 &self.pending_frame_scores,
-                true,
+                final_frame_scores.is_empty(),
             )
         };
+        if !final_frame_scores.is_empty() {
+            segments.extend(
+                self.post_processor
+                    .detect_chunk(&[], &final_frame_scores, true),
+            );
+        }
         self.reset();
         Ok(segments)
     }
@@ -242,6 +249,22 @@ impl FsmnVadStream {
 
         self.samples.extend_from_slice(samples);
         let feats = self.feature_stream.push_normalized_f32(samples)?;
+        let [frames, feat_dim] = feats.dims();
+        if feat_dim != FEAT_DIM {
+            bail!("FSMN VAD expects feature dim {FEAT_DIM}, got {feat_dim}");
+        }
+        let frame_scores = if frames > 0 {
+            self.weights
+                .forward_frame_scores_streaming(feats, &mut self.caches)?
+        } else {
+            Vec::new()
+        };
+        self.frame_scores.extend(frame_scores.clone());
+        Ok(frame_scores)
+    }
+
+    fn next_final_frame_scores(&mut self) -> Result<Vec<Vec<f32>>> {
+        let feats = self.feature_stream.finish()?;
         let [frames, feat_dim] = feats.dims();
         if feat_dim != FEAT_DIM {
             bail!("FSMN VAD expects feature dim {FEAT_DIM}, got {feat_dim}");
@@ -327,7 +350,27 @@ mod tests {
                 .iter()
                 .all(|segment| segment.range.end.0 - segment.range.start.0 <= 1_000)
         );
+
+        let streaming_segments = detect_streaming(&burn, &full_waveform, &options, 600)?;
+        let offline_segments = burn.detect(&full_waveform, &options)?;
+        assert_eq!(streaming_segments, offline_segments);
         Ok(())
+    }
+
+    fn detect_streaming(
+        model: &FsmnVadModel,
+        waveform: &Waveform,
+        options: &VadOptions,
+        chunk_ms: u64,
+    ) -> Result<Vec<VadSegment>> {
+        let mut stream = model.new_stream(options.clone());
+        let chunk_samples = (waveform.sample_rate as u64 * chunk_ms / 1000) as usize;
+        let mut segments = Vec::new();
+        for chunk in waveform.samples.chunks(chunk_samples) {
+            segments.extend(stream.push(chunk, waveform.sample_rate)?);
+        }
+        segments.extend(stream.finish()?);
+        Ok(segments)
     }
 
     fn workspace_root() -> PathBuf {

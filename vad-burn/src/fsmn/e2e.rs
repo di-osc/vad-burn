@@ -258,11 +258,17 @@ impl E2EVadModel {
     fn compute_decibel(&mut self, waveform: &[f32]) {
         let frame_sample_length = (self.opts.frame_length_ms * self.opts.sample_rate as i32) / 1000;
         let frame_shift_length = (self.opts.frame_in_ms * self.opts.sample_rate as i32) / 1000;
+        if waveform.is_empty() {
+            return;
+        }
         if self.data_buf_all_size == 0 {
             self.data_buf_all_size = waveform.len() as i32;
             self.data_buf_size = self.data_buf_all_size;
         } else {
             self.data_buf_all_size += waveform.len() as i32;
+        }
+        if waveform.len() < frame_sample_length as usize {
+            return;
         }
         let max_offset = waveform.len().saturating_sub(frame_sample_length as usize);
         let mut offset = 0usize;
