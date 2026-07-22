@@ -16,6 +16,7 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = []
 apple-amx = ["burn-flex/apple-amx"]
+metal = ["burn/metal"]
 python = ["dep:pyo3", "pyo3/abi3-py39"]
 extension-module = ["python", "pyo3/extension-module"]
 

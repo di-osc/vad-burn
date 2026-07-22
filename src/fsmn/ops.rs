@@ -1,18 +1,18 @@
 use anyhow::{Result, bail};
-use burn::backend::flex::FlexDevice;
+use burn::prelude::Backend as BurnBackend;
 use burn::tensor::module::conv1d;
 use burn::tensor::ops::ConvOptions;
 use burn::tensor::{DType, Tensor, TensorData};
 use burn_store::pytorch::PytorchReader;
 
-use super::constants::{Backend, CACHE_FRAMES, CONV_KERNEL, PROJ_DIM};
+use super::constants::{CACHE_FRAMES, CONV_KERNEL, PROJ_DIM};
 
-pub fn fsmn_memory(
-    input: Tensor<Backend, 2>,
-    cache: &Tensor<Backend, 2>,
-    kernel: Tensor<Backend, 3>,
+pub fn fsmn_memory<B: BurnBackend>(
+    input: Tensor<B, 2>,
+    cache: &Tensor<B, 2>,
+    kernel: Tensor<B, 3>,
     frames: usize,
-) -> Result<Tensor<Backend, 2>> {
+) -> Result<Tensor<B, 2>> {
     if input.dims() != [frames, PROJ_DIM] {
         bail!("unexpected FSMN input shape: {:?}", input.dims());
     }
@@ -37,10 +37,10 @@ pub fn fsmn_memory(
     Ok(input + memory)
 }
 
-pub fn next_cache(
-    input: &Tensor<Backend, 2>,
-    cache: &Tensor<Backend, 2>,
-) -> Result<Tensor<Backend, 2>> {
+pub fn next_cache<B: BurnBackend>(
+    input: &Tensor<B, 2>,
+    cache: &Tensor<B, 2>,
+) -> Result<Tensor<B, 2>> {
     let [frames, proj_dim] = input.dims();
     if proj_dim != PROJ_DIM {
         bail!("unexpected FSMN cache input shape: {:?}", input.dims());
@@ -54,7 +54,10 @@ pub fn next_cache(
     Ok(history.slice([total - CACHE_FRAMES..total, 0..PROJ_DIM]))
 }
 
-pub fn silence_posterior(logits: Tensor<Backend, 2>, rows: usize) -> Result<Tensor<Backend, 2>> {
+pub fn silence_posterior<B: BurnBackend>(
+    logits: Tensor<B, 2>,
+    rows: usize,
+) -> Result<Tensor<B, 2>> {
     let [actual_rows, _cols] = logits.dims();
     if actual_rows != rows {
         bail!("unexpected FSMN output shape: {:?}", logits.dims());
@@ -62,7 +65,11 @@ pub fn silence_posterior(logits: Tensor<Backend, 2>, rows: usize) -> Result<Tens
     Ok(burn::tensor::activation::softmax(logits, 1).slice([0..rows, 0..1]))
 }
 
-pub fn tensor_rows(tensor: Tensor<Backend, 2>, rows: usize, cols: usize) -> Result<Vec<Vec<f32>>> {
+pub fn tensor_rows<B: BurnBackend>(
+    tensor: Tensor<B, 2>,
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<Vec<f32>>> {
     if tensor.dims() != [rows, cols] {
         bail!("unexpected FSMN output shape: {:?}", tensor.dims());
     }
@@ -95,11 +102,11 @@ pub fn load_vec(reader: &PytorchReader, key: &str) -> Result<Vec<f32>> {
     Ok(snapshot.to_data()?.convert::<f32>().into_vec::<f32>()?)
 }
 
-pub fn load_conv_left_weight(
+pub fn load_conv_left_weight<B: BurnBackend>(
     reader: &PytorchReader,
-    device: &FlexDevice,
+    device: &B::Device,
     key: &str,
-) -> Result<Tensor<Backend, 3>> {
+) -> Result<Tensor<B, 3>> {
     let data = load_vec(reader, key)?;
     if data.len() != PROJ_DIM * CONV_KERNEL {
         bail!(
@@ -114,7 +121,7 @@ pub fn load_conv_left_weight(
             conv_data[channel * CONV_KERNEL + k] = data[k * PROJ_DIM + channel];
         }
     }
-    Ok(Tensor::<Backend, 3>::from_data(
+    Ok(Tensor::<B, 3>::from_data(
         TensorData::new(conv_data, [PROJ_DIM, 1, CONV_KERNEL]),
         device,
     ))

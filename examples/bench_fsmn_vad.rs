@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use burn::prelude::Backend as BurnBackend;
 use vad_burn::{FsmnForwardTiming, FsmnVadModel, VadOptions, Waveform};
 
 fn main() -> Result<()> {
@@ -12,12 +13,45 @@ fn main() -> Result<()> {
     }
 
     let options = VadOptions::default();
-    let burn = if let Some(model) = &args.model {
-        FsmnVadModel::from_pretrained(model)?
-    } else {
-        FsmnVadModel::from_modelscope()?
-    };
+    match args.backend {
+        BackendKind::Flex => run_benchmark(&args, &waveform, &options, load_flex_model(&args)?)?,
+        BackendKind::Metal => run_metal_benchmark(&args, &waveform, &options)?,
+    }
+    Ok(())
+}
 
+fn load_flex_model(args: &Args) -> Result<FsmnVadModel> {
+    if let Some(model) = &args.model {
+        FsmnVadModel::from_pretrained(model)
+    } else {
+        FsmnVadModel::from_modelscope()
+    }
+}
+
+#[cfg(feature = "metal")]
+fn run_metal_benchmark(args: &Args, waveform: &Waveform, options: &VadOptions) -> Result<()> {
+    use burn::backend::{Metal, wgpu::WgpuDevice};
+
+    let model_dir = args
+        .model
+        .clone()
+        .or_else(default_model_path)
+        .ok_or_else(|| anyhow::anyhow!("FSMN VAD model not found; pass --model MODEL_DIR"))?;
+    let burn = FsmnVadModel::<Metal>::from_pretrained_on_device(model_dir, WgpuDevice::default())?;
+    run_benchmark(args, waveform, options, burn)
+}
+
+#[cfg(not(feature = "metal"))]
+fn run_metal_benchmark(_args: &Args, _waveform: &Waveform, _options: &VadOptions) -> Result<()> {
+    bail!("--backend metal requires building with --features metal")
+}
+
+fn run_benchmark<B: BurnBackend>(
+    args: &Args,
+    waveform: &Waveform,
+    options: &VadOptions,
+    burn: FsmnVadModel<B>,
+) -> Result<()> {
     for _ in 0..args.warmup {
         let _ = burn.detect(&waveform, &options)?;
     }
@@ -63,7 +97,8 @@ fn main() -> Result<()> {
         / timing_count;
     let avg_ops = average_forward_ops(&timings);
     println!(
-        "burn_fsmn_vad_bench audio={} model={} duration_ms={} segments={} stream_segments={} warmup={} repeat={} stream_chunk_ms={}",
+        "burn_fsmn_vad_bench backend={} audio={} model={} duration_ms={} segments={} stream_segments={} warmup={} repeat={} stream_chunk_ms={}",
+        args.backend.as_str(),
         args.audio.display(),
         burn.model_dir().display(),
         waveform.duration_ms() as u64,
@@ -129,8 +164,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn detect_streaming(
-    model: &FsmnVadModel,
+fn detect_streaming<B: BurnBackend>(
+    model: &FsmnVadModel<B>,
     waveform: &Waveform,
     options: &VadOptions,
     chunk_ms: u64,
@@ -175,26 +210,33 @@ struct Args {
     warmup: usize,
     repeat: usize,
     stream_chunk_ms: u64,
+    backend: BackendKind,
 }
 
 impl Args {
     fn parse() -> Result<Self> {
+        Self::parse_from(std::env::args().skip(1))
+    }
+
+    fn parse_from(args: impl IntoIterator<Item = String>) -> Result<Self> {
         let mut audio = PathBuf::from("assets/vad_example.wav");
         let mut model = default_model_path();
         let mut warmup = 1usize;
         let mut repeat = 5usize;
         let mut stream_chunk_ms = 600u64;
-        let mut args = std::env::args().skip(1);
+        let mut backend = BackendKind::Flex;
+        let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--audio" => audio = next_path(&mut args, "--audio")?,
+                "--backend" => backend = next_backend(&mut args, "--backend")?,
                 "--model" => model = Some(next_path(&mut args, "--model")?),
                 "--warmup" => warmup = next_usize(&mut args, "--warmup")?,
                 "--repeat" => repeat = next_usize(&mut args, "--repeat")?,
                 "--stream-chunk-ms" => stream_chunk_ms = next_u64(&mut args, "--stream-chunk-ms")?,
                 "-h" | "--help" => {
                     println!(
-                        "Usage: cargo run -p vad-burn --example bench_fsmn_vad -- --audio WAV [--model MODEL_DIR] [--stream-chunk-ms 600]"
+                        "Usage: cargo run -p vad-burn --example bench_fsmn_vad -- --audio WAV [--backend flex|metal] [--model MODEL_DIR] [--stream-chunk-ms 600]"
                     );
                     std::process::exit(0);
                 }
@@ -211,7 +253,23 @@ impl Args {
             warmup,
             repeat,
             stream_chunk_ms,
+            backend,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackendKind {
+    Flex,
+    Metal,
+}
+
+impl BackendKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Flex => "flex",
+            Self::Metal => "metal",
+        }
     }
 }
 
@@ -235,9 +293,24 @@ fn next_u64(args: &mut impl Iterator<Item = String>, name: &str) -> Result<u64> 
         .parse()?)
 }
 
+fn next_backend(args: &mut impl Iterator<Item = String>, name: &str) -> Result<BackendKind> {
+    match args
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("{name} requires a value"))?
+        .as_str()
+    {
+        "flex" => Ok(BackendKind::Flex),
+        "metal" => Ok(BackendKind::Metal),
+        other => bail!("{name} must be flex or metal, got {other:?}"),
+    }
+}
+
 fn default_model_path() -> Option<PathBuf> {
     [
         PathBuf::from("/workspace/data/models/asr/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"),
+        PathBuf::from(
+            "/Users/wangmengdi/.cache/modelscope/hub/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        ),
         PathBuf::from(".cache/fsmn-vad"),
     ]
     .into_iter()
@@ -297,4 +370,22 @@ fn load_pcm16_wav(path: &Path) -> Result<Waveform> {
         .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / i16::MAX as f32)
         .collect();
     Ok(Waveform::new_with_channels(samples, sample_rate, channels))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_metal_backend() -> Result<()> {
+        let args = Args::parse_from([
+            "--backend".to_owned(),
+            "metal".to_owned(),
+            "--repeat".to_owned(),
+            "1".to_owned(),
+        ])?;
+
+        assert_eq!(args.backend, BackendKind::Metal);
+        Ok(())
+    }
 }

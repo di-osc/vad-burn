@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
+use burn::prelude::Backend as BurnBackend;
 use burn::tensor::Tensor;
 
 use super::constants::{Backend, FEAT_DIM, SAMPLE_RATE};
@@ -12,7 +13,7 @@ use super::timing::{FsmnForwardTiming, FsmnVadTiming};
 use super::weights::BurnFsmnWeights;
 use crate::{VadOptions, VadSegment, Waveform};
 
-pub type FeatureTensor = Tensor<Backend, 2>;
+pub type FeatureTensor<B = Backend> = Tensor<B, 2>;
 
 pub const DEFAULT_MODELSCOPE_REPO_ID: &str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch";
 pub const DEFAULT_MODELSCOPE_REVISION: &str = "master";
@@ -24,18 +25,18 @@ pub struct FsmnVadDetection {
     pub timing: FsmnVadTiming,
 }
 
-pub struct FsmnVadModel {
-    frontend: FsmnVadFrontend,
+pub struct FsmnVadModel<B: BurnBackend = Backend> {
+    frontend: FsmnVadFrontend<B>,
     post_processor: FsmnVadPostProcessor,
-    weights: Arc<BurnFsmnWeights>,
+    weights: Arc<BurnFsmnWeights<B>>,
     model_dir: PathBuf,
 }
 
-pub struct FsmnVadStream {
-    feature_stream: FsmnVadFeatureStream,
-    weights: Arc<BurnFsmnWeights>,
+pub struct FsmnVadStream<B: BurnBackend = Backend> {
+    feature_stream: FsmnVadFeatureStream<B>,
+    weights: Arc<BurnFsmnWeights<B>>,
     options: VadOptions,
-    caches: Vec<Tensor<Backend, 2>>,
+    caches: Vec<Tensor<B, 2>>,
     post_processor: FsmnVadStreamingPostProcessor,
     samples: Vec<f32>,
     pending_samples: Vec<f32>,
@@ -45,9 +46,18 @@ pub struct FsmnVadStream {
 
 impl FsmnVadModel {
     pub fn from_pretrained(model_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::from_pretrained_on_device(model_dir, Default::default())
+    }
+}
+
+impl<B: BurnBackend> FsmnVadModel<B> {
+    pub fn from_pretrained_on_device(
+        model_dir: impl AsRef<Path>,
+        device: B::Device,
+    ) -> Result<Self> {
         let model_dir = model_dir.as_ref().to_path_buf();
-        let frontend = FsmnVadFrontend::new(&model_dir)?;
-        let weights = BurnFsmnWeights::load(&model_dir)?;
+        let frontend = FsmnVadFrontend::new_on_device(&model_dir, device.clone())?;
+        let weights = BurnFsmnWeights::load(&model_dir, device)?;
         Ok(Self {
             frontend,
             post_processor: FsmnVadPostProcessor,
@@ -55,7 +65,9 @@ impl FsmnVadModel {
             model_dir,
         })
     }
+}
 
+impl FsmnVadModel {
     pub fn from_modelscope() -> Result<Self> {
         Self::from_modelscope_revision(DEFAULT_MODELSCOPE_REPO_ID, DEFAULT_MODELSCOPE_REVISION)
     }
@@ -78,19 +90,21 @@ impl FsmnVadModel {
         modelhub::modelscope::download_model_revision(repo_id, revision, &cache_dir).await?;
         Self::from_pretrained(modelscope_snapshot_dir(&cache_dir, repo_id, revision))
     }
+}
 
+impl<B: BurnBackend> FsmnVadModel<B> {
     pub fn model_dir(&self) -> &Path {
         &self.model_dir
     }
 
-    pub fn forward_frame_scores(&self, feats: FeatureTensor) -> Result<Vec<Vec<f32>>> {
+    pub fn forward_frame_scores(&self, feats: FeatureTensor<B>) -> Result<Vec<Vec<f32>>> {
         let mut caches = self.weights.zero_caches();
         self.weights.forward_frame_scores(feats, &mut caches)
     }
 
     pub fn forward_frame_scores_with_timing(
         &self,
-        feats: FeatureTensor,
+        feats: FeatureTensor<B>,
     ) -> Result<(Vec<Vec<f32>>, FsmnForwardTiming)> {
         let mut caches = self.weights.zero_caches();
         let mut timing = FsmnForwardTiming::default();
@@ -100,7 +114,7 @@ impl FsmnVadModel {
         Ok((scores, timing))
     }
 
-    pub fn new_stream(&self, options: VadOptions) -> FsmnVadStream {
+    pub fn new_stream(&self, options: VadOptions) -> FsmnVadStream<B> {
         FsmnVadStream {
             feature_stream: self.frontend.new_stream(),
             weights: Arc::clone(&self.weights),
@@ -205,7 +219,7 @@ fn modelscope_snapshot_dir(cache_dir: &Path, repo_id: &str, revision: &str) -> P
         .join(revision)
 }
 
-impl FsmnVadStream {
+impl<B: BurnBackend> FsmnVadStream<B> {
     pub fn push(&mut self, samples: &[f32], sample_rate: u32) -> Result<Vec<VadSegment>> {
         let frame_scores = self.next_frame_scores(samples, sample_rate)?;
         let segments = if self.pending_frame_scores.is_empty() {
@@ -319,6 +333,31 @@ mod tests {
     use super::*;
     use anyhow::{Result, bail};
 
+    #[cfg(feature = "metal")]
+    #[test]
+    fn burn_metal_detects_fixture() -> Result<()> {
+        use burn::backend::{Metal, wgpu::WgpuDevice};
+
+        let Some(model_dir) = default_model_path() else {
+            eprintln!("skipping: FSMN VAD model not found");
+            return Ok(());
+        };
+        let audio = workspace_root().join("assets/vad_example.wav");
+        if !audio.exists() {
+            eprintln!("skipping: {} not found", audio.display());
+            return Ok(());
+        }
+        let waveform = load_pcm16_wav(&audio)?.slice_ms(0, 12_000);
+        let options = VadOptions::default();
+        let burn =
+            FsmnVadModel::<Metal>::from_pretrained_on_device(model_dir, WgpuDevice::default())?;
+
+        let detection = burn.detect_with_timing(&waveform, &options)?;
+        assert!(!detection.frame_scores.is_empty());
+        assert!(!detection.segments.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn burn_flex_detects_fixture_and_splits_long_segments() -> Result<()> {
         let Some(model_dir) = default_model_path() else {
@@ -374,16 +413,16 @@ mod tests {
     }
 
     fn workspace_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace root")
-            .to_path_buf()
+        Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
     }
 
     fn default_model_path() -> Option<PathBuf> {
         [
             PathBuf::from(
                 "/workspace/data/models/asr/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+            ),
+            PathBuf::from(
+                "/Users/wangmengdi/.cache/modelscope/hub/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
             ),
             workspace_root().join(".cache/fsmn-vad"),
         ]

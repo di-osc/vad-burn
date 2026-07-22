@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use burn::backend::{Flex, flex::FlexDevice};
+use burn::prelude::Backend as BurnBackend;
 use burn::tensor::{Int, Tensor, TensorData};
 use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
@@ -10,37 +10,43 @@ use kaldi_fbank_rust_kautism::{
 use super::FeatureTensor;
 
 #[derive(Debug, Clone)]
-pub struct FsmnVadFrontend {
+pub struct FsmnVadFrontend<B: BurnBackend> {
     config: WavFrontendConfig,
-    device: FlexDevice,
-    cmvn_means: Option<FeatureTensor>,
-    cmvn_vars: Option<FeatureTensor>,
+    device: B::Device,
+    cmvn_means: Option<FeatureTensor<B>>,
+    cmvn_vars: Option<FeatureTensor<B>>,
 }
 
-pub struct FsmnVadFeatureStream {
+pub struct FsmnVadFeatureStream<B: BurnBackend> {
     config: WavFrontendConfig,
-    device: FlexDevice,
-    cmvn_means: Option<FeatureTensor>,
-    cmvn_vars: Option<FeatureTensor>,
+    device: B::Device,
+    cmvn_means: Option<FeatureTensor<B>>,
+    cmvn_vars: Option<FeatureTensor<B>>,
     fbank: OnlineFbank,
     fbank_frames: Vec<Vec<f32>>,
     emitted_lfr_frames: usize,
 }
 
-impl FsmnVadFrontend {
-    pub fn new(model_dir: impl AsRef<Path>) -> Result<Self> {
+impl<B: BurnBackend> FsmnVadFrontend<B> {
+    pub fn new_on_device(model_dir: impl AsRef<Path>, device: B::Device) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         validate_model_dir(model_dir)?;
-        Self::from_config(WavFrontendConfig {
-            sample_rate: 16_000,
-            lfr_m: 5,
-            lfr_n: 1,
-            cmvn_file: Some(model_dir.join("am.mvn")),
-            ..Default::default()
-        })
+        Self::from_config(
+            WavFrontendConfig {
+                sample_rate: 16_000,
+                lfr_m: 5,
+                lfr_n: 1,
+                cmvn_file: Some(model_dir.join("am.mvn")),
+                ..Default::default()
+            },
+            device,
+        )
     }
 
-    pub fn extract_features_from_normalized_f32(&self, samples: &[f32]) -> Result<FeatureTensor> {
+    pub fn extract_features_from_normalized_f32(
+        &self,
+        samples: &[f32],
+    ) -> Result<FeatureTensor<B>> {
         let waveform = samples
             .iter()
             .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
@@ -50,10 +56,10 @@ impl FsmnVadFrontend {
         Ok(self.apply_cmvn(lfr))
     }
 
-    pub fn new_stream(&self) -> FsmnVadFeatureStream {
+    pub fn new_stream(&self) -> FsmnVadFeatureStream<B> {
         FsmnVadFeatureStream {
             config: self.config.clone(),
-            device: self.device,
+            device: self.device.clone(),
             cmvn_means: self.cmvn_means.clone(),
             cmvn_vars: self.cmvn_vars.clone(),
             fbank: OnlineFbank::new(self.fbank_options()),
@@ -62,7 +68,7 @@ impl FsmnVadFrontend {
         }
     }
 
-    fn compute_fbank_features(&self, waveform: &[f32]) -> Result<FeatureTensor> {
+    fn compute_fbank_features(&self, waveform: &[f32]) -> Result<FeatureTensor<B>> {
         let mut fbank = OnlineFbank::new(self.fbank_options());
         fbank.accept_waveform(self.config.sample_rate as f32, waveform);
         let frames = fbank.num_ready_frames() as usize;
@@ -73,7 +79,7 @@ impl FsmnVadFrontend {
                 .ok_or_else(|| anyhow::anyhow!("missing fbank frame {i}"))?;
             out.extend_from_slice(frame);
         }
-        Ok(Tensor::<Flex, 2>::from_data(
+        Ok(Tensor::<B, 2>::from_data(
             TensorData::new(out, [frames, self.config.n_mels]),
             &self.device,
         ))
@@ -83,12 +89,12 @@ impl FsmnVadFrontend {
         fbank_options(&self.config)
     }
 
-    fn apply_lfr(&self, fbank: FeatureTensor) -> FeatureTensor {
+    fn apply_lfr(&self, fbank: FeatureTensor<B>) -> FeatureTensor<B> {
         let [t, _] = fbank.dims();
         let n_mels = self.config.n_mels;
         let feat_dim = n_mels * self.config.lfr_m;
         if t == 0 {
-            return Tensor::<Flex, 2>::zeros([0, feat_dim], &self.device);
+            return Tensor::<B, 2>::zeros([0, feat_dim], &self.device);
         }
 
         let t_lfr = t.div_ceil(self.config.lfr_n);
@@ -110,7 +116,7 @@ impl FsmnVadFrontend {
             for row in 0..t_lfr {
                 indices.push(((row * self.config.lfr_n + m).min(padded_rows - 1)) as i32);
             }
-            let indices = Tensor::<Flex, 1, Int>::from_data(
+            let indices = Tensor::<B, 1, Int>::from_data(
                 TensorData::new(indices, [t_lfr]).convert::<i32>(),
                 &self.device,
             );
@@ -119,13 +125,13 @@ impl FsmnVadFrontend {
         Tensor::cat(parts, 1)
     }
 
-    fn apply_cmvn(&self, feats: FeatureTensor) -> FeatureTensor {
+    fn apply_cmvn(&self, feats: FeatureTensor<B>) -> FeatureTensor<B> {
         apply_cmvn(feats, &self.cmvn_means, &self.cmvn_vars)
     }
 }
 
-impl FsmnVadFeatureStream {
-    pub fn push_normalized_f32(&mut self, samples: &[f32]) -> Result<FeatureTensor> {
+impl<B: BurnBackend> FsmnVadFeatureStream<B> {
+    pub fn push_normalized_f32(&mut self, samples: &[f32]) -> Result<FeatureTensor<B>> {
         let waveform = samples
             .iter()
             .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
@@ -137,7 +143,7 @@ impl FsmnVadFeatureStream {
         Ok(apply_cmvn(lfr, &self.cmvn_means, &self.cmvn_vars))
     }
 
-    pub fn finish(&mut self) -> Result<FeatureTensor> {
+    pub fn finish(&mut self) -> Result<FeatureTensor<B>> {
         self.fbank.input_finished();
         self.collect_ready_fbank_frames()?;
         let lfr = self.next_lfr_frames(true);
@@ -162,12 +168,12 @@ impl FsmnVadFeatureStream {
         Ok(())
     }
 
-    fn next_lfr_frames(&mut self, is_final: bool) -> FeatureTensor {
+    fn next_lfr_frames(&mut self, is_final: bool) -> FeatureTensor<B> {
         let fbank_rows = self.fbank_frames.len();
         let n_mels = self.config.n_mels;
         let feat_dim = n_mels * self.config.lfr_m;
         if fbank_rows == 0 {
-            return Tensor::<Flex, 2>::zeros([0, feat_dim], &self.device);
+            return Tensor::<B, 2>::zeros([0, feat_dim], &self.device);
         }
 
         let total_lfr_frames = if is_final {
@@ -176,7 +182,7 @@ impl FsmnVadFeatureStream {
             self.complete_lfr_frame_count(fbank_rows)
         };
         if total_lfr_frames <= self.emitted_lfr_frames {
-            return Tensor::<Flex, 2>::zeros([0, feat_dim], &self.device);
+            return Tensor::<B, 2>::zeros([0, feat_dim], &self.device);
         }
 
         let left_padding_rows = (self.config.lfr_m - 1) / 2;
@@ -193,7 +199,7 @@ impl FsmnVadFeatureStream {
         }
         self.emitted_lfr_frames = total_lfr_frames;
 
-        Tensor::<Flex, 2>::from_data(
+        Tensor::<B, 2>::from_data(
             TensorData::new(out, [new_lfr_frames, feat_dim]),
             &self.device,
         )
@@ -208,11 +214,11 @@ impl FsmnVadFeatureStream {
     }
 }
 
-fn apply_cmvn(
-    feats: FeatureTensor,
-    cmvn_means: &Option<FeatureTensor>,
-    cmvn_vars: &Option<FeatureTensor>,
-) -> FeatureTensor {
+fn apply_cmvn<B: BurnBackend>(
+    feats: FeatureTensor<B>,
+    cmvn_means: &Option<FeatureTensor<B>>,
+    cmvn_vars: &Option<FeatureTensor<B>>,
+) -> FeatureTensor<B> {
     let (Some(means), Some(vars)) = (cmvn_means, cmvn_vars) else {
         return feats;
     };
@@ -267,18 +273,17 @@ impl Default for WavFrontendConfig {
     }
 }
 
-impl FsmnVadFrontend {
-    fn from_config(config: WavFrontendConfig) -> Result<Self> {
-        let device = FlexDevice;
+impl<B: BurnBackend> FsmnVadFrontend<B> {
+    fn from_config(config: WavFrontendConfig, device: B::Device) -> Result<Self> {
         let (cmvn_means, cmvn_vars) = if let Some(cmvn_path) = &config.cmvn_file {
             let (means, vars) = load_cmvn(cmvn_path)?;
             let dim = means.len();
             (
-                Some(Tensor::<Flex, 2>::from_data(
+                Some(Tensor::<B, 2>::from_data(
                     TensorData::new(means, [1, dim]),
                     &device,
                 )),
-                Some(Tensor::<Flex, 2>::from_data(
+                Some(Tensor::<B, 2>::from_data(
                     TensorData::new(vars, [1, dim]),
                     &device,
                 )),

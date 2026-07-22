@@ -2,9 +2,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use burn::backend::flex::FlexDevice;
 use burn::module::Param;
 use burn::nn::Linear;
+use burn::prelude::Backend as BurnBackend;
 use burn::tensor::{Tensor, TensorData};
 use burn_store::pytorch::PytorchReader;
 
@@ -16,31 +16,30 @@ use super::ops::{
 };
 use super::timing::FsmnForwardTiming;
 
-pub struct BurnFsmnWeights {
-    device: FlexDevice,
-    in_linear1: BurnLinear,
-    in_linear2: BurnLinear,
-    blocks: Vec<BurnFsmnBlock>,
-    out_linear1: BurnLinear,
-    out_linear2: BurnLinear,
+pub struct BurnFsmnWeights<B: BurnBackend = Backend> {
+    device: B::Device,
+    in_linear1: BurnLinear<B>,
+    in_linear2: BurnLinear<B>,
+    blocks: Vec<BurnFsmnBlock<B>>,
+    out_linear1: BurnLinear<B>,
+    out_linear2: BurnLinear<B>,
 }
 
-struct BurnFsmnBlock {
-    linear: BurnLinear,
-    affine: BurnLinear,
-    conv_left_weight: Tensor<Backend, 3>,
+struct BurnFsmnBlock<B: BurnBackend = Backend> {
+    linear: BurnLinear<B>,
+    affine: BurnLinear<B>,
+    conv_left_weight: Tensor<B, 3>,
 }
 
-struct BurnLinear {
-    inner: Linear<Backend>,
+struct BurnLinear<B: BurnBackend = Backend> {
+    inner: Linear<B>,
 }
 
-impl BurnFsmnWeights {
-    pub fn load(model_dir: &Path) -> Result<Self> {
+impl<B: BurnBackend> BurnFsmnWeights<B> {
+    pub fn load(model_dir: &Path, device: B::Device) -> Result<Self> {
         let model_path = model_dir.join("model.pt");
         let reader = PytorchReader::new(&model_path)
             .with_context(|| format!("failed to load {}", model_path.display()))?;
-        let device = FlexDevice;
         let mut blocks = Vec::with_capacity(LAYERS);
         for idx in 0..LAYERS {
             blocks.push(BurnFsmnBlock {
@@ -64,7 +63,7 @@ impl BurnFsmnWeights {
             });
         }
         Ok(Self {
-            device,
+            device: device.clone(),
             in_linear1: BurnLinear::load(&reader, &device, "encoder.in_linear1.linear", true)?,
             in_linear2: BurnLinear::load(&reader, &device, "encoder.in_linear2.linear", true)?,
             blocks,
@@ -73,32 +72,32 @@ impl BurnFsmnWeights {
         })
     }
 
-    pub fn zero_caches(&self) -> Vec<Tensor<Backend, 2>> {
+    pub fn zero_caches(&self) -> Vec<Tensor<B, 2>> {
         (0..LAYERS)
-            .map(|_| Tensor::<Backend, 2>::zeros([CACHE_FRAMES, PROJ_DIM], &self.device))
+            .map(|_| Tensor::<B, 2>::zeros([CACHE_FRAMES, PROJ_DIM], &self.device))
             .collect()
     }
 
     pub fn forward_frame_scores(
         &self,
-        feats: FeatureTensor,
-        caches: &mut [Tensor<Backend, 2>],
+        feats: FeatureTensor<B>,
+        caches: &mut [Tensor<B, 2>],
     ) -> Result<Vec<Vec<f32>>> {
         self.forward_frame_scores_inner(feats, caches, false)
     }
 
     pub fn forward_frame_scores_streaming(
         &self,
-        feats: FeatureTensor,
-        caches: &mut [Tensor<Backend, 2>],
+        feats: FeatureTensor<B>,
+        caches: &mut [Tensor<B, 2>],
     ) -> Result<Vec<Vec<f32>>> {
         self.forward_frame_scores_inner(feats, caches, true)
     }
 
     fn forward_frame_scores_inner(
         &self,
-        feats: FeatureTensor,
-        caches: &mut [Tensor<Backend, 2>],
+        feats: FeatureTensor<B>,
+        caches: &mut [Tensor<B, 2>],
         update_caches: bool,
     ) -> Result<Vec<Vec<f32>>> {
         let [frames, feat_dim] = feats.dims();
@@ -123,8 +122,8 @@ impl BurnFsmnWeights {
 
     pub fn forward_frame_scores_with_timing(
         &self,
-        feats: FeatureTensor,
-        caches: &mut [Tensor<Backend, 2>],
+        feats: FeatureTensor<B>,
+        caches: &mut [Tensor<B, 2>],
         timing: &mut FsmnForwardTiming,
     ) -> Result<Vec<Vec<f32>>> {
         let [frames, feat_dim] = feats.dims();
@@ -169,14 +168,14 @@ impl BurnFsmnWeights {
     }
 }
 
-impl BurnFsmnBlock {
+impl<B: BurnBackend> BurnFsmnBlock<B> {
     fn forward(
         &self,
-        input: Tensor<Backend, 2>,
+        input: Tensor<B, 2>,
         frames: usize,
-        cache: &mut Tensor<Backend, 2>,
+        cache: &mut Tensor<B, 2>,
         update_cache: bool,
-    ) -> Result<Tensor<Backend, 2>> {
+    ) -> Result<Tensor<B, 2>> {
         let projected = self.linear.forward(input, false);
         let memory = fsmn_memory(
             projected.clone(),
@@ -192,13 +191,13 @@ impl BurnFsmnBlock {
 
     fn forward_with_timing(
         &self,
-        input: Tensor<Backend, 2>,
+        input: Tensor<B, 2>,
         frames: usize,
-        cache: &Tensor<Backend, 2>,
+        cache: &Tensor<B, 2>,
         idx: usize,
         timing: &mut FsmnForwardTiming,
         update_cache: bool,
-    ) -> Result<Tensor<Backend, 2>> {
+    ) -> Result<Tensor<B, 2>> {
         let start = Instant::now();
         let projected = self.linear.forward(input, false);
         timing.block_linear_seconds[idx] += start.elapsed().as_secs_f64();
@@ -220,10 +219,10 @@ impl BurnFsmnBlock {
     }
 }
 
-impl BurnLinear {
+impl<B: BurnBackend> BurnLinear<B> {
     fn load(
         reader: &PytorchReader,
-        device: &FlexDevice,
+        device: &B::Device,
         prefix: &str,
         has_bias: bool,
     ) -> Result<Self> {
@@ -249,12 +248,12 @@ impl BurnLinear {
         };
         Ok(Self {
             inner: Linear {
-                weight: Param::from_tensor(Tensor::<Backend, 2>::from_data(
+                weight: Param::from_tensor(Tensor::<B, 2>::from_data(
                     TensorData::new(weight_t, [in_dim, out_dim]),
                     device,
                 )),
                 bias: bias_vec.map(|bias| {
-                    Param::from_tensor(Tensor::<Backend, 1>::from_data(
+                    Param::from_tensor(Tensor::<B, 1>::from_data(
                         TensorData::new(bias, [out_dim]),
                         device,
                     ))
@@ -263,7 +262,7 @@ impl BurnLinear {
         })
     }
 
-    fn forward(&self, input: Tensor<Backend, 2>, relu: bool) -> Tensor<Backend, 2> {
+    fn forward(&self, input: Tensor<B, 2>, relu: bool) -> Tensor<B, 2> {
         let mut out = self.inner.forward(input);
         if relu {
             out = burn::tensor::activation::relu(out);
