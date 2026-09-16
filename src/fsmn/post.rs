@@ -1,5 +1,5 @@
 use super::e2e::{E2EVadConfig, E2EVadModel};
-use crate::{DurationMs, TimeRange, VadOptions, VadSegment, Waveform};
+use crate::{FSMN_VAD_SOURCE, TimeSpan, VadOptions, Waveform, span_confidence, speech_span};
 use anyhow::Result;
 
 pub const FRAME_SHIFT_SAMPLES: usize = 160;
@@ -17,9 +17,9 @@ impl FsmnVadPostProcessor {
         frame_scores: &[Vec<f32>],
         options: &VadOptions,
         mut refine_long_segment: F,
-    ) -> Result<Vec<VadSegment>>
+    ) -> Result<Vec<TimeSpan>>
     where
-        F: FnMut(&Waveform, &VadSegment, &VadOptions, u64) -> Result<Vec<VadSegment>>,
+        F: FnMut(&Waveform, &TimeSpan, &VadOptions, u64) -> Result<Vec<TimeSpan>>,
     {
         let mut e2e = build_e2e_model(options);
         let max_end_sil = options.min_silence_ms as i32;
@@ -48,9 +48,13 @@ impl FsmnVadPostProcessor {
 
         let raw_segments = ms_segments
             .into_iter()
-            .map(|(start, end)| VadSegment {
-                range: TimeRange::new(DurationMs(start), DurationMs(end)),
-                probability: options.threshold,
+            .map(|(start, end)| {
+                speech_span(
+                    start as usize,
+                    end as usize,
+                    options.threshold,
+                    FSMN_VAD_SOURCE,
+                )
             })
             .filter(|segment| segment_duration_ms(segment) >= options.min_speech_ms)
             .collect::<Vec<_>>();
@@ -60,12 +64,12 @@ impl FsmnVadPostProcessor {
     fn split_segments_for_asr<F>(
         &self,
         waveform: &Waveform,
-        segments: &[VadSegment],
+        segments: &[TimeSpan],
         options: &VadOptions,
         refine_long_segment: &mut F,
-    ) -> Result<Vec<VadSegment>>
+    ) -> Result<Vec<TimeSpan>>
     where
-        F: FnMut(&Waveform, &VadSegment, &VadOptions, u64) -> Result<Vec<VadSegment>>,
+        F: FnMut(&Waveform, &TimeSpan, &VadOptions, u64) -> Result<Vec<TimeSpan>>,
     {
         let max_segment_ms = options.max_segment_ms;
         if segments.is_empty() || max_segment_ms == 0 {
@@ -94,13 +98,13 @@ impl FsmnVadPostProcessor {
     fn refine_long_segment<F>(
         &self,
         waveform: &Waveform,
-        segment: &VadSegment,
+        segment: &TimeSpan,
         options: &VadOptions,
         max_segment_ms: u64,
         refine_long_segment: &mut F,
-    ) -> Result<Vec<VadSegment>>
+    ) -> Result<Vec<TimeSpan>>
     where
-        F: FnMut(&Waveform, &VadSegment, &VadOptions, u64) -> Result<Vec<VadSegment>>,
+        F: FnMut(&Waveform, &TimeSpan, &VadOptions, u64) -> Result<Vec<TimeSpan>>,
     {
         let mut current = vec![segment.clone()];
         for silence_ms in REFINE_SILENCE_MS {
@@ -162,14 +166,18 @@ impl FsmnVadStreamingPostProcessor {
         samples: &[f32],
         frame_scores: &[Vec<f32>],
         is_final: bool,
-    ) -> Vec<VadSegment> {
+    ) -> Vec<TimeSpan> {
         let max_end_sil = self.options.min_silence_ms as i32;
         self.e2e
             .detect_chunk(frame_scores, samples, is_final, max_end_sil)
             .into_iter()
-            .map(|(start, end)| VadSegment {
-                range: TimeRange::new(DurationMs(start), DurationMs(end)),
-                probability: self.options.threshold,
+            .map(|(start, end)| {
+                speech_span(
+                    start as usize,
+                    end as usize,
+                    self.options.threshold,
+                    FSMN_VAD_SOURCE,
+                )
             })
             .filter(|segment| segment_duration_ms(segment) >= self.options.min_speech_ms)
             .collect()
@@ -184,25 +192,24 @@ fn build_e2e_model(options: &VadOptions) -> E2EVadModel {
     E2EVadModel::new(config)
 }
 
-fn hard_split_segment(segment: &VadSegment, max_segment_ms: u64) -> Vec<VadSegment> {
+fn hard_split_segment(segment: &TimeSpan, max_segment_ms: u64) -> Vec<TimeSpan> {
     if max_segment_ms == 0 || segment_duration_ms(segment) <= max_segment_ms {
         return vec![segment.clone()];
     }
 
     let mut split = Vec::new();
-    let mut start = segment.range.start.0;
-    let end = segment.range.end.0;
+    let mut start = segment.range.start_ms;
+    let end = segment.range.end_ms;
+    let confidence = span_confidence(segment);
+    let max_segment_ms = max_segment_ms as usize;
     while start < end {
         let next = start.saturating_add(max_segment_ms).min(end);
-        split.push(VadSegment {
-            range: TimeRange::new(DurationMs(start), DurationMs(next)),
-            probability: segment.probability,
-        });
+        split.push(speech_span(start, next, confidence, FSMN_VAD_SOURCE));
         start = next;
     }
     split
 }
 
-fn segment_duration_ms(segment: &VadSegment) -> u64 {
-    segment.range.end.0.saturating_sub(segment.range.start.0)
+fn segment_duration_ms(segment: &TimeSpan) -> u64 {
+    segment.range.duration() as u64
 }

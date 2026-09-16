@@ -9,6 +9,6 @@ mod weights;
 
 pub use model::{
     DEFAULT_MODELSCOPE_REPO_ID, DEFAULT_MODELSCOPE_REVISION, FeatureTensor, FsmnVadDetection,
-    FsmnVadModel, FsmnVadStream,
+    FsmnVadModel, FsmnVadSession,
 };
 pub use timing::{FsmnForwardTiming, FsmnVadTiming};

@@ -22,20 +22,26 @@ pip install vad-burn
 ## Rust
 
 ```rust
-use vad_burn::{FsmnVadModel, VadOptions, Waveform};
+use vad_burn::{Audio, FsmnVadModel, VadOptions, Waveform};
 
 let model = FsmnVadModel::from_modelscope()?;
 let waveform = Waveform::new(samples, 16_000);
 let segments = model.detect(&waveform, &VadOptions::default())?;
+
+let mut audio = Audio::from_path("example.wav")?;
+model.annotate(&mut audio, &VadOptions::default())?;
 ```
 
 ## Python
 
 ```python
+from asr_data import Audio
 from vad_burn import FsmnVadModel, VadOptions
 
 vad = FsmnVadModel.from_modelscope()
 segments = vad.detect(samples, 16000, VadOptions())
+audio = Audio.from_path("example.wav")
+vad.annotate(audio, VadOptions())
 ```
 
 `samples` 必须是 16 kHz 单声道、归一化到 `[-1.0, 1.0]` 的浮点 PCM。

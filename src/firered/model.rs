@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +14,10 @@ use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
 
-use crate::{DurationMs, TimeRange, VadOptions, VadSegment, Waveform};
+use crate::{
+    Audio, AudioChannel, AudioChunk, AudioStream, FIRERED_VAD_SOURCE, TimeSpan, VadOptions,
+    Waveform, annotate_audio, prepare_stream_16k, speech_span,
+};
 
 type Backend = burn::backend::Flex;
 
@@ -42,7 +46,7 @@ pub struct FireRedVadTiming {
 
 #[derive(Debug, Clone)]
 pub struct FireRedVadDetection {
-    pub segments: Vec<VadSegment>,
+    pub segments: Vec<TimeSpan>,
     pub frame_scores: Vec<f32>,
     pub timing: FireRedVadTiming,
 }
@@ -55,10 +59,17 @@ pub struct FireRedVadModel {
     stream_model_dir: PathBuf,
 }
 
-pub struct FireRedVadStream {
-    feature_stream: FireRedFeatureStream,
+/// 有状态的流式 FireRedVAD 会话，持有特征缓存和 FSMN cache。
+pub struct FireRedVadSession {
     weights: Arc<FireRedVadWeights>,
     options: VadOptions,
+    channels: HashMap<AudioChannel, FireRedVadChannel>,
+    resamplers: HashMap<AudioChannel, asr_data::StreamingResampler>,
+}
+
+/// 单个声道的流式推理状态。
+struct FireRedVadChannel {
+    feature_stream: FireRedFeatureStream,
     caches: Vec<Vec<f32>>,
     postprocessor: FireRedStreamVadPostprocessor,
     frame_scores: Vec<f32>,
@@ -117,18 +128,19 @@ impl FireRedVadModel {
         &self.stream_model_dir
     }
 
-    pub fn new_stream(&self, options: VadOptions) -> FireRedVadStream {
-        FireRedVadStream {
-            feature_stream: self.stream_weights.frontend.new_stream(),
+    /// 创建有状态的流式推理会话，使用 Stream-VAD 权重。
+    ///
+    /// 每个音频流对应一个会话；不要在同一会话上并发调用 `push` / `finish`。
+    pub fn new_session(&self, options: VadOptions) -> FireRedVadSession {
+        FireRedVadSession {
             weights: Arc::clone(&self.stream_weights),
-            caches: self.stream_weights.zero_caches(),
-            postprocessor: FireRedStreamVadPostprocessor::from_options(&options),
             options,
-            frame_scores: Vec::new(),
+            channels: HashMap::new(),
+            resamplers: HashMap::new(),
         }
     }
 
-    pub fn detect(&self, waveform: &Waveform, options: &VadOptions) -> Result<Vec<VadSegment>> {
+    pub fn detect(&self, waveform: &Waveform, options: &VadOptions) -> Result<Vec<TimeSpan>> {
         validate_waveform(waveform)?;
 
         let feats = self.offline_weights.frontend.extract(&waveform.samples)?;
@@ -142,6 +154,15 @@ impl FireRedVadModel {
 
         let probs = self.offline_weights.forward_probs(feats)?;
         Ok(FireRedVadPostprocessor::from_options(options).process_to_segments(&probs, waveform))
+    }
+
+    /// 按声道检测并把 `speech` 活动写进 [`Audio`] 的 prediction timeline。
+    ///
+    /// # Errors
+    ///
+    /// 解码、重采样、推理或写入标注失败时返回错误。
+    pub fn annotate(&self, audio: &mut Audio, options: &VadOptions) -> Result<()> {
+        annotate_audio(audio, |waveform| self.detect(waveform, options))
     }
 
     pub fn detect_with_timing(
@@ -185,11 +206,126 @@ impl FireRedVadModel {
     }
 }
 
-impl FireRedVadStream {
-    pub fn push(&mut self, samples: &[f32], sample_rate: u32) -> Result<Vec<VadSegment>> {
+impl FireRedVadSession {
+    /// 标注已经从 `stream` 拉下来的一块音频，并把新产生的 activity 写进 timeline。
+    ///
+    /// 每个声道使用独立推理状态。源采样率不是 16 kHz 时在内部做有状态重采样。
+    /// 最后一块会 flush 该声道。返回本块新写出的 span，便于立刻使用中间结果。
+    ///
+    /// # Errors
+    ///
+    /// 重采样、推理或写入标注失败时返回错误。
+    pub fn annotate(
+        &mut self,
+        stream: &mut AudioStream,
+        chunk: &AudioChunk,
+    ) -> Result<Vec<TimeSpan>> {
+        stream.annotate_activity_chunk(chunk, |channel, waveform, is_final| {
+            self.annotate_waveform(channel, waveform, is_final)
+        })
+    }
+
+    /// 处理一块指定声道的流式波形，不写入 timeline。
+    ///
+    /// `is_final` 时冲刷该声道会话。采样率由模型在内部重采样到 16 kHz。
+    ///
+    /// # Errors
+    ///
+    /// 采样率为 0、重采样或推理失败时返回错误。
+    pub fn annotate_waveform(
+        &mut self,
+        channel: AudioChannel,
+        waveform: &Waveform,
+        is_final: bool,
+    ) -> Result<Vec<TimeSpan>> {
+        let prepared = prepare_stream_16k(waveform, is_final, &mut self.resamplers, channel)?;
+        let input = match prepared.as_ref() {
+            Some(wave) if wave.samples.is_empty() && !is_final => return Ok(Vec::new()),
+            Some(wave) => wave,
+            None => waveform,
+        };
+        let mut spans = self.push_channel(channel, &input.samples, input.sample_rate)?;
+        if is_final {
+            spans.extend(self.finish_channel(channel)?);
+        }
+        Ok(spans)
+    }
+
+    pub fn push(&mut self, samples: &[f32], sample_rate: u32) -> Result<Vec<TimeSpan>> {
+        self.push_channel(AudioChannel::Mono, samples, sample_rate)
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<TimeSpan>> {
+        let spans = if self.channels.contains_key(&AudioChannel::Mono) {
+            self.finish_channel(AudioChannel::Mono)?
+        } else {
+            Vec::new()
+        };
+        self.reset();
+        Ok(spans)
+    }
+
+    pub fn reset(&mut self) {
+        self.channels.clear();
+        self.resamplers.clear();
+    }
+
+    pub fn frame_scores(&self) -> &[f32] {
+        self.channels
+            .get(&AudioChannel::Mono)
+            .map(|channel| channel.frame_scores.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn options(&self) -> &VadOptions {
+        &self.options
+    }
+
+    fn channel_mut(&mut self, channel: AudioChannel) -> &mut FireRedVadChannel {
+        if !self.channels.contains_key(&channel) {
+            let inner = FireRedVadChannel::new(&self.weights, &self.options);
+            self.channels.insert(channel, inner);
+        }
+        self.channels
+            .get_mut(&channel)
+            .expect("channel session inserted")
+    }
+
+    fn push_channel(
+        &mut self,
+        channel: AudioChannel,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<Vec<TimeSpan>> {
         let waveform = Waveform::new(samples.to_vec(), sample_rate);
         validate_waveform(&waveform)?;
-        let feats = self.feature_stream.push(&waveform.samples)?;
+        let weights = Arc::clone(&self.weights);
+        self.channel_mut(channel).push(&weights, &waveform.samples)
+    }
+
+    fn finish_channel(&mut self, channel: AudioChannel) -> Result<Vec<TimeSpan>> {
+        let weights = Arc::clone(&self.weights);
+        Ok(self
+            .channels
+            .remove(&channel)
+            .map(|mut inner| inner.finish(&weights))
+            .transpose()?
+            .unwrap_or_default())
+    }
+}
+
+impl FireRedVadChannel {
+    fn new(weights: &FireRedVadWeights, options: &VadOptions) -> Self {
+        Self {
+            feature_stream: weights.frontend.new_stream(),
+            caches: weights.zero_caches(),
+            postprocessor: FireRedStreamVadPostprocessor::from_options(options),
+            frame_scores: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, weights: &FireRedVadWeights, samples: &[f32]) -> Result<Vec<TimeSpan>> {
+        let feats = self.feature_stream.push(samples)?;
         let [frames, feat_dim] = feats.dims();
         if feat_dim != INPUT_DIM {
             bail!("FireRedVAD expects feature dim {INPUT_DIM}, got {feat_dim}");
@@ -197,14 +333,12 @@ impl FireRedVadStream {
         if frames == 0 {
             return Ok(Vec::new());
         }
-        let probs = self
-            .weights
-            .forward_probs_streaming(feats, &mut self.caches)?;
+        let probs = weights.forward_probs_streaming(feats, &mut self.caches)?;
         self.frame_scores.extend_from_slice(&probs);
         Ok(self.postprocessor.process_probs(&probs))
     }
 
-    pub fn finish(&mut self) -> Result<Vec<VadSegment>> {
+    fn finish(&mut self, weights: &FireRedVadWeights) -> Result<Vec<TimeSpan>> {
         let feats = self.feature_stream.finish()?;
         let [frames, feat_dim] = feats.dims();
         if feat_dim != INPUT_DIM {
@@ -213,30 +347,12 @@ impl FireRedVadStream {
         let mut segments = if frames == 0 {
             Vec::new()
         } else {
-            let probs = self
-                .weights
-                .forward_probs_streaming(feats, &mut self.caches)?;
+            let probs = weights.forward_probs_streaming(feats, &mut self.caches)?;
             self.frame_scores.extend_from_slice(&probs);
             self.postprocessor.process_probs(&probs)
         };
         segments.extend(self.postprocessor.finish());
-        self.reset();
         Ok(segments)
-    }
-
-    pub fn reset(&mut self) {
-        self.feature_stream = self.weights.frontend.new_stream();
-        self.caches = self.weights.zero_caches();
-        self.postprocessor = FireRedStreamVadPostprocessor::from_options(&self.options);
-        self.frame_scores.clear();
-    }
-
-    pub fn frame_scores(&self) -> &[f32] {
-        &self.frame_scores
-    }
-
-    pub fn options(&self) -> &VadOptions {
-        &self.options
     }
 }
 
@@ -796,7 +912,7 @@ impl FireRedVadPostprocessor {
         }
     }
 
-    fn process_to_segments(&self, probs: &[f32], waveform: &Waveform) -> Vec<VadSegment> {
+    fn process_to_segments(&self, probs: &[f32], waveform: &Waveform) -> Vec<TimeSpan> {
         if probs.is_empty() {
             return Vec::new();
         }
@@ -978,19 +1094,18 @@ impl FireRedVadPostprocessor {
         splits
     }
 
-    fn decision_to_segments(&self, decisions: &[usize], wav_dur_seconds: f64) -> Vec<VadSegment> {
+    fn decision_to_segments(&self, decisions: &[usize], wav_dur_seconds: f64) -> Vec<TimeSpan> {
         self.decision_to_seconds(decisions, wav_dur_seconds)
             .into_iter()
-            .map(|(start, end)| VadSegment {
-                range: TimeRange::new(
-                    DurationMs((start * 1000.0).round() as u64),
-                    DurationMs((end * 1000.0).round() as u64),
-                ),
-                probability: self.prob_threshold,
+            .map(|(start, end)| {
+                speech_span(
+                    (start * 1000.0).round() as usize,
+                    (end * 1000.0).round() as usize,
+                    self.prob_threshold,
+                    FIRERED_VAD_SOURCE,
+                )
             })
-            .filter(|segment| {
-                segment.range.end.0.saturating_sub(segment.range.start.0) >= self.min_speech_ms
-            })
+            .filter(|segment| segment.range.duration() as u64 >= self.min_speech_ms)
             .collect()
     }
 
@@ -1070,21 +1185,21 @@ impl FireRedStreamVadPostprocessor {
         }
     }
 
-    fn process_probs(&mut self, probs: &[f32]) -> Vec<VadSegment> {
+    fn process_probs(&mut self, probs: &[f32]) -> Vec<TimeSpan> {
         probs
             .iter()
             .filter_map(|prob| self.process_one_frame(*prob))
             .collect()
     }
 
-    fn process_one_frame(&mut self, raw_prob: f32) -> Option<VadSegment> {
+    fn process_one_frame(&mut self, raw_prob: f32) -> Option<TimeSpan> {
         self.frame_cnt += 1;
         let smoothed_prob = self.smooth_prob(raw_prob.clamp(0.0, 1.0));
         let is_speech = smoothed_prob >= self.speech_threshold;
         self.state_transition(is_speech)
     }
 
-    fn finish(&mut self) -> Vec<VadSegment> {
+    fn finish(&mut self) -> Vec<TimeSpan> {
         self.last_speech_start_frame
             .take()
             .and_then(|start| self.segment_from_frames(start, self.frame_cnt))
@@ -1106,7 +1221,7 @@ impl FireRedStreamVadPostprocessor {
         self.smooth_window_sum / self.smooth_window.len() as f32
     }
 
-    fn state_transition(&mut self, is_speech: bool) -> Option<VadSegment> {
+    fn state_transition(&mut self, is_speech: bool) -> Option<TimeSpan> {
         if self.hit_max_speech {
             self.last_speech_start_frame = Some(self.frame_cnt);
             self.hit_max_speech = false;
@@ -1178,7 +1293,7 @@ impl FireRedStreamVadPostprocessor {
         None
     }
 
-    fn close_current_segment(&mut self, hit_max_speech: bool) -> Option<VadSegment> {
+    fn close_current_segment(&mut self, hit_max_speech: bool) -> Option<TimeSpan> {
         self.hit_max_speech = hit_max_speech;
         self.speech_cnt = 0;
         let start = self.last_speech_start_frame.take()?;
@@ -1187,16 +1302,18 @@ impl FireRedStreamVadPostprocessor {
         self.segment_from_frames(start, end)
     }
 
-    fn segment_from_frames(&self, start_frame: usize, end_frame: usize) -> Option<VadSegment> {
+    fn segment_from_frames(&self, start_frame: usize, end_frame: usize) -> Option<TimeSpan> {
         let start_ms = start_frame.saturating_sub(1) as u64 * FRAME_SHIFT_MS;
         let end_ms = end_frame.saturating_sub(1) as u64 * FRAME_SHIFT_MS;
         if end_ms.saturating_sub(start_ms) < self.min_speech_frame as u64 * FRAME_SHIFT_MS {
             return None;
         }
-        Some(VadSegment {
-            range: TimeRange::new(DurationMs(start_ms), DurationMs(end_ms)),
-            probability: self.speech_threshold,
-        })
+        Some(speech_span(
+            start_ms as usize,
+            end_ms as usize,
+            self.speech_threshold,
+            FIRERED_VAD_SOURCE,
+        ))
     }
 }
 

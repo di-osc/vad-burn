@@ -4,7 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "vad-burn"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+dependencies = [
+    "asr-data>=0.1.1",
+]
 classifiers = [
   "Programming Language :: Rust",
   "Programming Language :: Python :: 3",

@@ -1,10 +1,10 @@
 from .vad_burn import (
     FireRedVadDetection as FireRedVadDetection,
     FireRedVadModel as FireRedVadModel,
-    FireRedVadStream as FireRedVadStream,
+    FireRedVadSession as FireRedVadSession,
     FireRedVadTiming as FireRedVadTiming,
     FsmnVadModel as FsmnVadModel,
-    FsmnVadStream as FsmnVadStream,
+    FsmnVadSession as FsmnVadSession,
     VadDetection as VadDetection,
     VadOptions as VadOptions,
     VadSegment as VadSegment,

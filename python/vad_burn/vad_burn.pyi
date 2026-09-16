@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Optional
 
+from asr_data import Audio, AudioChunk
 
 class VadOptions:
     """Segmentation options used by both offline and streaming VAD."""
@@ -36,14 +37,14 @@ class VadOptions:
         max_segment_ms: int = 30000,
         pad_ms: int = 0,
     ) -> None: ...
-
     def __repr__(self) -> str: ...
-
     def __str__(self) -> str: ...
 
-
 class VadSegment:
-    """Detected speech segment."""
+    """Detected speech activity span aligned with asr-data TimeSpan fields."""
+
+    id: str
+    """Generated span id."""
 
     start_ms: int
     """Segment start time in milliseconds."""
@@ -51,13 +52,17 @@ class VadSegment:
     end_ms: int
     """Segment end time in milliseconds."""
 
-    probability: float
-    """Segment score reported by the post-processor."""
+    confidence: float
+    """Activity confidence written onto AudioActivity."""
+
+    event: Optional[str]
+    """Activity event name, usually \"speech\"."""
+
+    source: Optional[str]
+    """Prediction source, for example \"fsmn-vad\" or \"firered-vad\"."""
 
     def __repr__(self) -> str: ...
-
     def __str__(self) -> str: ...
-
 
 class VadTiming:
     """Timing breakdown for a timed VAD run."""
@@ -72,9 +77,7 @@ class VadTiming:
     """Segmentation post-processing time in seconds."""
 
     def __repr__(self) -> str: ...
-
     def __str__(self) -> str: ...
-
 
 class VadDetection:
     """Timed VAD detection result."""
@@ -89,9 +92,7 @@ class VadDetection:
     """Timing breakdown."""
 
     def __repr__(self) -> str: ...
-
     def __str__(self) -> str: ...
-
 
 class FireRedVadTiming:
     """Timing breakdown for a timed FireRedVAD run."""
@@ -109,9 +110,7 @@ class FireRedVadTiming:
     """Number of acoustic frames processed."""
 
     def __repr__(self) -> str: ...
-
     def __str__(self) -> str: ...
-
 
 class FireRedVadDetection:
     """Timed FireRedVAD detection result."""
@@ -126,17 +125,15 @@ class FireRedVadDetection:
     """Timing breakdown."""
 
     def __repr__(self) -> str: ...
-
     def __str__(self) -> str: ...
 
-
-class FsmnVadStream:
+class FsmnVadSession:
     """Stateful streaming FSMN VAD session.
 
-    A stream owns mutable decoding state and should be driven sequentially by
+    A session owns mutable decoding state and should be driven sequentially by
     one audio stream. Do not call push(), finish(), or reset() concurrently on
-    the same stream. For parallel streaming sessions, create one stream per
-    audio stream with FsmnVadModel.new_stream().
+    the same session. For parallel streaming sessions, create one session per
+    audio stream with FsmnVadModel.new_session().
     """
 
     def push(self, samples: Sequence[float], sample_rate: int) -> list[VadSegment]:
@@ -148,25 +145,33 @@ class FsmnVadStream:
         """
         ...
 
+    def annotate(self, chunk: AudioChunk) -> list[VadSegment]:
+        """Annotate one AudioChunk and write new activity onto the parent stream.
+
+        Iterate the AudioStream yourself and call this per chunk so intermediate
+        timeline predictions remain available. Sample rate is a model property
+        and is resampled to 16 kHz internally. Each channel uses independent
+        decoder state; the last chunk flushes via finish().
+        """
+        ...
+
     def finish(self) -> list[VadSegment]:
         """Flush the final pending chunk, return remaining segments, and reset state."""
         ...
 
     def reset(self) -> None:
-        """Clear stream state and cached frames."""
+        """Clear session state and cached frames."""
         ...
 
     def __repr__(self) -> str: ...
-
     def __str__(self) -> str: ...
-
 
 class FsmnVadModel:
     """FSMN VAD model.
 
     The loaded model can be shared across threads for offline detect() calls
-    and for creating independent streaming sessions. Each new_stream() call
-    returns a separate stateful stream; the stream itself is not a shared
+    and for creating independent streaming sessions. Each new_session() call
+    returns a separate stateful session; the session itself is not a shared
     concurrent object.
     """
 
@@ -204,6 +209,14 @@ class FsmnVadModel:
         """
         ...
 
+    def annotate(
+        self,
+        audio: Audio,
+        options: Optional[VadOptions] = None,
+    ) -> Audio:
+        """Detect speech per channel and write AudioActivity predictions onto audio."""
+        ...
+
     def detect_with_timing(
         self,
         samples: Sequence[float],
@@ -216,26 +229,24 @@ class FsmnVadModel:
         """
         ...
 
-    def new_stream(self, options: Optional[VadOptions] = None) -> FsmnVadStream:
+    def new_session(self, options: Optional[VadOptions] = None) -> FsmnVadSession:
         """Create a stateful streaming VAD session from this loaded model.
 
-        Use one stream per audio stream when running multiple streams in
+        Use one session per audio stream when running multiple streams in
         parallel.
         """
         ...
 
     def __repr__(self) -> str: ...
-
     def __str__(self) -> str: ...
 
-
-class FireRedVadStream:
+class FireRedVadSession:
     """Stateful streaming FireRedVAD session.
 
-    A stream owns mutable FSMN caches and streaming post-processing state. Do
-    not call push(), finish(), or reset() concurrently on the same stream. For
-    parallel streaming sessions, create one stream per audio stream with
-    FireRedVadModel.new_stream().
+    A session owns mutable FSMN caches and streaming post-processing state. Do
+    not call push(), finish(), or reset() concurrently on the same session. For
+    parallel streaming sessions, create one session per audio stream with
+    FireRedVadModel.new_session().
     """
 
     def push(self, samples: Sequence[float], sample_rate: int) -> list[VadSegment]:
@@ -243,7 +254,17 @@ class FireRedVadStream:
 
         Samples must be normalized float PCM values, usually in the range
         [-1.0, 1.0]. FireRedVadModel.from_modelscope() loads both official
-        VAD and Stream-VAD weights; streams use the Stream-VAD weights.
+        VAD and Stream-VAD weights; sessions use the Stream-VAD weights.
+        """
+        ...
+
+    def annotate(self, chunk: AudioChunk) -> list[VadSegment]:
+        """Annotate one AudioChunk and write new activity onto the parent stream.
+
+        Iterate the AudioStream yourself and call this per chunk so intermediate
+        timeline predictions remain available. Sample rate is a model property
+        and is resampled to 16 kHz internally. Each channel uses independent
+        decoder state; the last chunk flushes via finish().
         """
         ...
 
@@ -252,13 +273,11 @@ class FireRedVadStream:
         ...
 
     def reset(self) -> None:
-        """Clear stream state, FSMN caches, and cached frame scores."""
+        """Clear session state, FSMN caches, and cached frame scores."""
         ...
 
     def __repr__(self) -> str: ...
-
     def __str__(self) -> str: ...
-
 
 class FireRedVadModel:
     """FireRedVAD model implemented with Burn Flex.
@@ -267,7 +286,7 @@ class FireRedVadModel:
     detect() calls and for creating independent streaming sessions.
     from_modelscope() loads both official VAD and Stream-VAD weights. When
     loading from disk, pass the official repository root containing VAD/ and
-    Stream-VAD/ to make detect() and new_stream() use their matching weights.
+    Stream-VAD/ to make detect() and new_session() use their matching weights.
     """
 
     def __init__(self, model_dir: str) -> None:
@@ -298,7 +317,7 @@ class FireRedVadModel:
 
         Defaults to repo_id "xukaituo/FireRedVAD" and revision "master".
         Both VAD and Stream-VAD subdirectories are loaded into one model
-        object. detect() uses VAD; new_stream() uses Stream-VAD.
+        object. detect() uses VAD; new_session() uses Stream-VAD.
         """
         ...
 
@@ -315,6 +334,14 @@ class FireRedVadModel:
         """
         ...
 
+    def annotate(
+        self,
+        audio: Audio,
+        options: Optional[VadOptions] = None,
+    ) -> Audio:
+        """Detect speech per channel and write AudioActivity predictions onto audio."""
+        ...
+
     def detect_with_timing(
         self,
         samples: Sequence[float],
@@ -327,15 +354,14 @@ class FireRedVadModel:
         """
         ...
 
-    def new_stream(self, options: Optional[VadOptions] = None) -> FireRedVadStream:
+    def new_session(self, options: Optional[VadOptions] = None) -> FireRedVadSession:
         """Create a stateful streaming FireRedVAD session from this loaded model.
 
-        The stream uses the Stream-VAD weights when the model was loaded from
-        ModelScope or from an official local repository root. Use one stream
+        The session uses the Stream-VAD weights when the model was loaded from
+        ModelScope or from an official local repository root. Use one session
         per audio stream when running multiple streams in parallel.
         """
         ...
 
     def __repr__(self) -> str: ...
-
     def __str__(self) -> str: ...

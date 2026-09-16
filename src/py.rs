@@ -1,8 +1,9 @@
 use pyo3::prelude::*;
 
 use crate::{
-    FireRedVadDetection, FireRedVadModel, FireRedVadStream, FireRedVadTiming, FsmnVadDetection,
-    FsmnVadModel, FsmnVadStream, FsmnVadTiming, VadOptions, VadSegment, Waveform,
+    FireRedVadDetection, FireRedVadModel, FireRedVadSession, FireRedVadTiming, FsmnVadDetection,
+    FsmnVadModel, FsmnVadSession, FsmnVadTiming, TimeSpan, VadOptions, Waveform,
+    parse_audio_channel, span_confidence,
 };
 
 #[pyclass(name = "VadOptions")]
@@ -72,19 +73,33 @@ impl From<&PyVadOptions> for VadOptions {
 #[derive(Debug, Clone)]
 pub struct PyVadSegment {
     #[pyo3(get)]
-    pub start_ms: u64,
+    pub id: String,
     #[pyo3(get)]
-    pub end_ms: u64,
+    pub start_ms: usize,
     #[pyo3(get)]
-    pub probability: f32,
+    pub end_ms: usize,
+    #[pyo3(get)]
+    pub confidence: f32,
+    #[pyo3(get)]
+    pub event: Option<String>,
+    #[pyo3(get)]
+    pub source: Option<String>,
 }
 
-impl From<VadSegment> for PyVadSegment {
-    fn from(segment: VadSegment) -> Self {
+impl From<TimeSpan> for PyVadSegment {
+    fn from(segment: TimeSpan) -> Self {
+        let event = match &segment.annotation {
+            asr_data::Annotation::Activity(activity) => activity.event.clone(),
+            _ => None,
+        };
+        let confidence = span_confidence(&segment);
         Self {
-            start_ms: segment.range.start.0,
-            end_ms: segment.range.end.0,
-            probability: segment.probability,
+            id: segment.id,
+            start_ms: segment.range.start_ms,
+            end_ms: segment.range.end_ms,
+            confidence,
+            event,
+            source: segment.source,
         }
     }
 }
@@ -93,8 +108,8 @@ impl From<VadSegment> for PyVadSegment {
 impl PyVadSegment {
     fn __repr__(&self) -> String {
         format!(
-            "VadSegment(start_ms={}, end_ms={}, probability={:.3})",
-            self.start_ms, self.end_ms, self.probability
+            "VadSegment(id={:?}, start_ms={}, end_ms={}, confidence={:.3}, event={:?}, source={:?})",
+            self.id, self.start_ms, self.end_ms, self.confidence, self.event, self.source
         )
     }
 
@@ -260,14 +275,14 @@ pub struct PyFireRedVadModel {
     inner: FireRedVadModel,
 }
 
-#[pyclass(name = "FireRedVadStream", unsendable)]
-pub struct PyFireRedVadStream {
-    inner: FireRedVadStream,
+#[pyclass(name = "FireRedVadSession", unsendable)]
+pub struct PyFireRedVadSession {
+    inner: FireRedVadSession,
 }
 
-#[pyclass(name = "FsmnVadStream", unsendable)]
-pub struct PyFsmnVadStream {
-    inner: FsmnVadStream,
+#[pyclass(name = "FsmnVadSession", unsendable)]
+pub struct PyFsmnVadSession {
+    inner: FsmnVadSession,
 }
 
 #[pymethods]
@@ -332,10 +347,10 @@ impl PyFsmnVadModel {
     }
 
     #[pyo3(signature = (options=None))]
-    fn new_stream(&self, options: Option<&PyVadOptions>) -> PyFsmnVadStream {
+    fn new_session(&self, options: Option<&PyVadOptions>) -> PyFsmnVadSession {
         let options = options.map_or_else(VadOptions::default, Into::into);
-        PyFsmnVadStream {
-            inner: self.inner.new_stream(options),
+        PyFsmnVadSession {
+            inner: self.inner.new_session(options),
         }
     }
 
@@ -411,10 +426,10 @@ impl PyFireRedVadModel {
     }
 
     #[pyo3(signature = (options=None))]
-    fn new_stream(&self, options: Option<&PyVadOptions>) -> PyFireRedVadStream {
+    fn new_session(&self, options: Option<&PyVadOptions>) -> PyFireRedVadSession {
         let options = options.map_or_else(VadOptions::default, Into::into);
-        PyFireRedVadStream {
-            inner: self.inner.new_stream(options),
+        PyFireRedVadSession {
+            inner: self.inner.new_session(options),
         }
     }
 
@@ -428,7 +443,7 @@ impl PyFireRedVadModel {
 }
 
 #[pymethods]
-impl PyFireRedVadStream {
+impl PyFireRedVadSession {
     fn push(&mut self, samples: Vec<f32>, sample_rate: u32) -> PyResult<Vec<PyVadSegment>> {
         Ok(self
             .inner
@@ -446,8 +461,27 @@ impl PyFireRedVadStream {
         self.inner.reset();
     }
 
+    /// 处理一块指定声道的流式波形；采样率在内部重采样到 16 kHz。
+    #[pyo3(signature = (samples, sample_rate, channel, is_final))]
+    fn annotate_waveform(
+        &mut self,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        channel: &str,
+        is_final: bool,
+    ) -> PyResult<Vec<PyVadSegment>> {
+        let channel = parse_audio_channel(channel)?;
+        let waveform = Waveform::new(samples, sample_rate);
+        Ok(self
+            .inner
+            .annotate_waveform(channel, &waveform, is_final)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     fn __repr__(&self) -> String {
-        "FireRedVadStream()".to_owned()
+        "FireRedVadSession()".to_owned()
     }
 
     fn __str__(&self) -> String {
@@ -456,7 +490,7 @@ impl PyFireRedVadStream {
 }
 
 #[pymethods]
-impl PyFsmnVadStream {
+impl PyFsmnVadSession {
     fn push(&mut self, samples: Vec<f32>, sample_rate: u32) -> PyResult<Vec<PyVadSegment>> {
         Ok(self
             .inner
@@ -474,8 +508,27 @@ impl PyFsmnVadStream {
         self.inner.reset();
     }
 
+    /// 处理一块指定声道的流式波形；采样率在内部重采样到 16 kHz。
+    #[pyo3(signature = (samples, sample_rate, channel, is_final))]
+    fn annotate_waveform(
+        &mut self,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        channel: &str,
+        is_final: bool,
+    ) -> PyResult<Vec<PyVadSegment>> {
+        let channel = parse_audio_channel(channel)?;
+        let waveform = Waveform::new(samples, sample_rate);
+        Ok(self
+            .inner
+            .annotate_waveform(channel, &waveform, is_final)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     fn __repr__(&self) -> String {
-        "FsmnVadStream()".to_owned()
+        "FsmnVadSession()".to_owned()
     }
 
     fn __str__(&self) -> String {
@@ -487,8 +540,8 @@ impl PyFsmnVadStream {
 fn vad_burn(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFsmnVadModel>()?;
     m.add_class::<PyFireRedVadModel>()?;
-    m.add_class::<PyFsmnVadStream>()?;
-    m.add_class::<PyFireRedVadStream>()?;
+    m.add_class::<PyFsmnVadSession>()?;
+    m.add_class::<PyFireRedVadSession>()?;
     m.add_class::<PyVadOptions>()?;
     m.add_class::<PyVadSegment>()?;
     m.add_class::<PyVadTiming>()?;

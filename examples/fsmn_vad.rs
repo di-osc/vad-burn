@@ -1,9 +1,9 @@
-//! FireRedVAD：离线 annotate，以及按 chunk 流式 annotate。
+//! FSMN VAD：离线 annotate，以及按 chunk 流式 annotate。
 
 use std::path::PathBuf;
 
 use anyhow::Result;
-use vad_burn::{Audio, AudioStream, FireRedVadModel, VadOptions};
+use vad_burn::{Audio, AudioStream, FsmnVadModel, VadOptions};
 
 /// 仓库内置示例音频路径。
 fn example_wav() -> PathBuf {
@@ -11,12 +11,8 @@ fn example_wav() -> PathBuf {
 }
 
 fn main() -> Result<()> {
-    let model = FireRedVadModel::from_modelscope()?;
-    let options = VadOptions {
-        threshold: 0.8,
-        min_silence_ms: 800,
-        ..VadOptions::default()
-    };
+    let model = FsmnVadModel::from_modelscope()?;
+    let options = VadOptions::default();
     let wav = example_wav();
 
     // 离线：整段音频按声道标注，采样率在 annotate 内部处理。

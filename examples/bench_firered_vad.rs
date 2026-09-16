@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use vad_burn::{FireRedVadModel, VadOptions, VadSegment, Waveform};
+use vad_burn::{FireRedVadModel, TimeSpan, VadOptions, Waveform};
 
 fn main() -> Result<()> {
     let args = Args::parse()?;
@@ -70,17 +70,17 @@ fn detect_streaming(
     waveform: &Waveform,
     options: &VadOptions,
     chunk_ms: u64,
-) -> Result<Vec<VadSegment>> {
-    let mut stream = model.new_stream(options.clone());
+) -> Result<Vec<TimeSpan>> {
+    let mut session = model.new_session(options.clone());
     let chunk_samples = ((waveform.sample_rate as u64 * chunk_ms) / 1000).max(1) as usize;
     let mut segments = Vec::new();
     let mut offset = 0usize;
     while offset < waveform.samples.len() {
         let end = (offset + chunk_samples).min(waveform.samples.len());
-        segments.extend(stream.push(&waveform.samples[offset..end], waveform.sample_rate)?);
+        segments.extend(session.push(&waveform.samples[offset..end], waveform.sample_rate)?);
         offset = end;
     }
-    segments.extend(stream.finish()?);
+    segments.extend(session.finish()?);
     Ok(segments)
 }
 
