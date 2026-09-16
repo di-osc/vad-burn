@@ -194,7 +194,9 @@ dependencies = [
 
 [[package]]
 name = "asr-data"
-version = "0.1.1"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75f8922018f09d5e8b70cb25b567980c8220bc46b7d393fffe660377a1b62686"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

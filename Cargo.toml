@@ -22,7 +22,7 @@ extension-module = ["python", "pyo3/extension-module"]
 
 [dependencies]
 anyhow = "1"
-asr-data = { path = "../asr-data", default-features = false }
+asr-data = { version = "0.1.2", default-features = false }
 burn = { version = "0.21.0", default-features = false, features = ["std", "flex", "store", "simd"] }
 burn-flex = { version = "0.21.0", default-features = false, features = ["rayon"] }
 burn-store = "0.21.0"
