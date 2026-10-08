@@ -1,0 +1,26 @@
+# FireRedVAD 检测边界 golden 快照，勿手工编辑。
+# 音频: assets/vad_example.wav (16 kHz mono, 70.47 s)
+# 模型: xukaituo/FireRedVAD@master（离线 VAD / 流式 Stream-VAD）
+# 参数: threshold=0.8, min_silence_ms=800, chunk=600ms
+# 刷新: UPDATE_GOLDEN=1 cargo test --lib firered
+# 格式: <start_ms>-<end_ms>，每行一个 span
+[offline]
+350-2830
+2850-26650
+27070-29480
+30210-31970
+32000-38180
+38480-47480
+47570-50100
+50160-70471
+[streaming]
+360-2830
+2860-6680
+6690-24130
+24140-26670
+27080-29500
+30230-31970
+32020-38220
+38490-47490
+47590-50140
+50170-70440

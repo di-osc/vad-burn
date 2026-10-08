@@ -1423,3 +1423,108 @@ fn read_kaldi_i32(bytes: &[u8], offset: &mut usize) -> Result<i32> {
     *offset += 4;
     Ok(value)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::golden;
+
+    /// 定位本地已缓存的 FireRedVAD 模型；未下载时返回 `None`，测试跳过。
+    fn default_model_path() -> Option<PathBuf> {
+        let snapshot = modelscope_snapshot_dir(
+            &modelhub::modelscope::cache_dir(),
+            DEFAULT_FIRERED_MODELSCOPE_REPO_ID,
+            DEFAULT_FIRERED_MODELSCOPE_REVISION,
+        );
+        [
+            snapshot,
+            PathBuf::from("/workspace/data/models/asr/xukaituo/FireRedVAD"),
+        ]
+        .into_iter()
+        .find(|path| path.join("VAD").is_dir() && path.join("Stream-VAD").is_dir())
+    }
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    }
+
+    /// 固定阈值与静音门限，保证快照可复现（与 `examples/firered_vad.rs` 一致）。
+    fn golden_options() -> VadOptions {
+        VadOptions {
+            threshold: 0.8,
+            min_silence_ms: 800,
+            ..VadOptions::default()
+        }
+    }
+
+    /// 按固定 chunk 长度做流式检测，与 benchmark 的切块方式一致。
+    fn detect_streaming(
+        model: &FireRedVadModel,
+        waveform: &Waveform,
+        options: &VadOptions,
+        chunk_ms: u64,
+    ) -> Result<Vec<TimeSpan>> {
+        let mut session = model.new_session(options.clone());
+        let chunk_samples = ((waveform.sample_rate as u64 * chunk_ms) / 1000).max(1) as usize;
+        let mut segments = Vec::new();
+        let mut offset = 0usize;
+        while offset < waveform.samples.len() {
+            let end = (offset + chunk_samples).min(waveform.samples.len());
+            segments.extend(session.push(&waveform.samples[offset..end], waveform.sample_rate)?);
+            offset = end;
+        }
+        segments.extend(session.finish()?);
+        Ok(segments)
+    }
+
+    /// 用示例音频锁定 FireRedVAD 的检测边界，防止特征层改动悄悄改变切分结果。
+    ///
+    /// 刷新基线（必须人工 review diff）：
+    ///
+    /// ```bash
+    /// UPDATE_GOLDEN=1 cargo test --lib firered
+    /// ```
+    #[test]
+    fn matches_golden_spans() -> Result<()> {
+        let Some(model_dir) = default_model_path() else {
+            eprintln!("skipping: FireRedVAD model not found");
+            return Ok(());
+        };
+        let audio = workspace_root().join("assets/vad_example.wav");
+        if !audio.exists() {
+            eprintln!("skipping: {} not found", audio.display());
+            return Ok(());
+        }
+
+        let waveform = Waveform::from_path(&audio)?;
+        let options = golden_options();
+        let model = FireRedVadModel::from_pretrained(model_dir)?;
+
+        let offline = golden::span_lines(&model.detect(&waveform, &options)?);
+        let streaming = golden::span_lines(&detect_streaming(&model, &waveform, &options, 600)?);
+
+        let path = golden::fixture_path(&workspace_root(), "firered_vad_example_spans.txt");
+        let contents = golden::render(
+            &[
+                "FireRedVAD 检测边界 golden 快照，勿手工编辑。".to_owned(),
+                "音频: assets/vad_example.wav (16 kHz mono, 70.47 s)".to_owned(),
+                "模型: xukaituo/FireRedVAD@master（离线 VAD / 流式 Stream-VAD）".to_owned(),
+                "参数: threshold=0.8, min_silence_ms=800, chunk=600ms".to_owned(),
+                "刷新: UPDATE_GOLDEN=1 cargo test --lib firered".to_owned(),
+                "格式: <start_ms>-<end_ms>，每行一个 span".to_owned(),
+            ],
+            &[
+                ("offline".to_owned(), offline.clone()),
+                ("streaming".to_owned(), streaming.clone()),
+            ],
+        );
+        if golden::write_if_requested(&path, contents)? {
+            return Ok(());
+        }
+
+        let expected = golden::parse(&golden::read(&path)?)?;
+        golden::assert_lines_eq("离线", &offline, golden::section(&expected, "offline")?);
+        golden::assert_lines_eq("流式", &streaming, golden::section(&expected, "streaming")?);
+        Ok(())
+    }
+}

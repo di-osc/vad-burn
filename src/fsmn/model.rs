@@ -459,6 +459,7 @@ fn validate_waveform(waveform: &Waveform) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::golden;
     use anyhow::Result;
 
     #[cfg(feature = "metal")]
@@ -529,6 +530,63 @@ mod tests {
                 .zip(&offline_segments)
                 .all(|(left, right)| left.content_eq(right))
         );
+        Ok(())
+    }
+
+    /// 用示例音频锁定 FSMN VAD 的检测边界，防止特征层改动悄悄改变切分结果。
+    ///
+    /// 这是**特征实现的回归基线**：fbank 从 Kaldi C++ 换成 Burn 算子后，特征并非
+    /// 逐位相同（对数域最大误差约 `1e-4`），因此需要一条端到端的边界断言来兜底。
+    ///
+    /// 若确实需要刷新基线（例如更换模型或有意调整算法），执行：
+    ///
+    /// ```bash
+    /// UPDATE_GOLDEN=1 cargo test --lib burn_flex_matches_golden_spans
+    /// ```
+    ///
+    /// 刷新后必须人工 review `tests/fixtures/fsmn_vad_example_spans.txt` 的 diff。
+    #[test]
+    fn burn_flex_matches_golden_spans() -> Result<()> {
+        let Some(model_dir) = default_model_path() else {
+            eprintln!("skipping: FSMN VAD model not found");
+            return Ok(());
+        };
+        let audio = workspace_root().join("assets/vad_example.wav");
+        if !audio.exists() {
+            eprintln!("skipping: {} not found", audio.display());
+            return Ok(());
+        }
+
+        let waveform = Waveform::from_path(&audio)?;
+        let options = VadOptions::default();
+        let burn = FsmnVadModel::from_pretrained(model_dir)?;
+
+        let offline = golden::span_lines(&burn.detect(&waveform, &options)?);
+        let streaming = golden::span_lines(&detect_streaming(&burn, &waveform, &options, 600)?);
+
+        let path = golden::fixture_path(&workspace_root(), "fsmn_vad_example_spans.txt");
+        let contents = golden::render(
+            &[
+                "FSMN VAD 检测边界 golden 快照，勿手工编辑。".to_owned(),
+                "音频: assets/vad_example.wav (16 kHz mono, 70.47 s)".to_owned(),
+                "模型: iic/speech_fsmn_vad_zh-cn-16k-common-pytorch".to_owned(),
+                "刷新: UPDATE_GOLDEN=1 cargo test --lib burn_flex_matches_golden_spans".to_owned(),
+                "格式: <start_ms>-<end_ms>，每行一个 span".to_owned(),
+            ],
+            &[
+                ("offline".to_owned(), offline.clone()),
+                ("streaming".to_owned(), streaming.clone()),
+            ],
+        );
+        if golden::write_if_requested(&path, contents)? {
+            return Ok(());
+        }
+
+        let expected = golden::parse(&golden::read(&path)?)?;
+        golden::assert_lines_eq("离线", &offline, golden::section(&expected, "offline")?);
+        golden::assert_lines_eq("流式", &streaming, golden::section(&expected, "streaming")?);
+        // 离线与流式在 snip_edges 语义下应当完全一致，顺带守住这条不变量。
+        golden::assert_lines_eq("流式 vs 离线", &streaming, &offline);
         Ok(())
     }
 

@@ -101,8 +101,22 @@ fbank / LFR / CMVN 全部用 Burn 算子实现，不再依赖 `kaldi-native-fban
 Hamming 窗最大绝对误差 `6.6e-5`、Povey 窗 `3.6e-4`（对数域，RMS 约 `3e-6`）。
 该 crate 已降级为 `dev-dependency`，仅在测试中使用。
 
+此外还有一层端到端回归护栏：把 FSMN VAD 与 FireRedVAD 在示例音频上的检测边界
+固化成 golden 快照（`tests/fixtures/*.txt`）。特征在浮点层面并非逐位相同，
+这条断言保证切分结果不漂移；一旦变化会打印首个差异位置。
+
 ```bash
+# 逐帧数值对拍
 cargo test --lib fbank:: -- --nocapture
+
+# 检测边界 golden 回归
+cargo test --lib golden
+```
+
+需要刷新 golden 基线时（例如更换模型或有意调整算法），刷新后**必须人工 review diff**：
+
+```bash
+UPDATE_GOLDEN=1 cargo test --lib golden
 ```
 
 ## Rust 用法
@@ -159,3 +173,6 @@ cargo fmt --check
 cargo test -- --nocapture
 cargo test --features metal -- --nocapture
 ```
+
+`tests/fixtures/` 下是检测边界的 golden 快照，锁定 FSMN VAD / FireRedVAD 的切分结果；
+用 `UPDATE_GOLDEN=1 cargo test --lib golden` 重建后需人工确认 diff。

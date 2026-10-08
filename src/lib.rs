@@ -1,6 +1,8 @@
 mod fbank;
 pub mod firered;
 pub mod fsmn;
+#[cfg(test)]
+mod golden;
 #[cfg(feature = "python")]
 mod py;
 mod types;
