@@ -10,10 +10,8 @@ use burn::tensor::ops::ConvOptions;
 use burn::tensor::{Device, Tensor, TensorData};
 use burn_store::pytorch::PytorchReader;
 use burn_store::pytorch_reader::DType;
-use kaldi_fbank_rust_kautism::{
-    FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
-};
 
+use crate::fbank::{FbankExtractor, FbankOptions, FbankStream, WindowType, to_kaldi_scale};
 use crate::{
     Audio, AudioChannel, AudioChunk, AudioStream, FIRERED_VAD_SOURCE, TimeSpan, VadOptions,
     Waveform, annotate_audio, prepare_stream_16k, speech_span,
@@ -745,15 +743,17 @@ impl BurnLinear {
 
 #[derive(Clone)]
 struct FireRedFrontend {
-    means: Vec<f32>,
-    inverse_std: Vec<f32>,
+    /// CMVN 均值，形状 `[1, INPUT_DIM]`。
+    means: Tensor<2>,
+    /// CMVN 逆标准差，形状 `[1, INPUT_DIM]`。
+    inverse_std: Tensor<2>,
     device: Device,
+    fbank: FbankExtractor,
 }
 
 struct FireRedFeatureStream {
     frontend: FireRedFrontend,
-    fbank: OnlineFbank,
-    emitted_frames: usize,
+    fbank: FbankStream,
 }
 
 impl FireRedFrontend {
@@ -766,98 +766,65 @@ impl FireRedFrontend {
                 inverse_std.len()
             );
         }
+        let device = Device::flex();
+        // FireRedVAD 使用 Kaldi 默认的 povey 窗，而不是 FSMN 的 hamming 窗。
+        let fbank = FbankExtractor::new(
+            FbankOptions {
+                sample_rate: SAMPLE_RATE,
+                frame_length_ms: FRAME_LENGTH_MS as f32,
+                frame_shift_ms: FRAME_SHIFT_MS as f32,
+                num_mel_bins: INPUT_DIM,
+                low_freq: 20.0,
+                high_freq: 0.0,
+                preemph_coeff: 0.97,
+                remove_dc_offset: true,
+                window_type: WindowType::Povey,
+                round_to_power_of_two: true,
+            },
+            device.clone(),
+        )?;
         Ok(Self {
-            means,
-            inverse_std,
-            device: Device::flex(),
+            means: Tensor::<2>::from_data(TensorData::new(means, [1, INPUT_DIM]), &device),
+            inverse_std: Tensor::<2>::from_data(
+                TensorData::new(inverse_std, [1, INPUT_DIM]),
+                &device,
+            ),
+            device,
+            fbank,
         })
     }
 
     fn extract(&self, samples: &[f32]) -> Result<Tensor<2>> {
-        let waveform = samples
-            .iter()
-            .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
-            .collect::<Vec<_>>();
-        let mut fbank = OnlineFbank::new(Self::fbank_options());
-        fbank.accept_waveform(SAMPLE_RATE as f32, &waveform);
-        let frames = fbank.num_ready_frames() as usize;
-        self.collect_frames(&fbank, 0, frames)
+        let waveform = to_kaldi_scale(samples);
+        Ok(self.apply_cmvn(self.fbank.compute(&waveform)))
     }
 
     fn new_stream(&self) -> FireRedFeatureStream {
         FireRedFeatureStream {
             frontend: self.clone(),
-            fbank: OnlineFbank::new(Self::fbank_options()),
-            emitted_frames: 0,
+            fbank: FbankStream::new(&self.fbank),
         }
     }
 
-    fn collect_frames(
-        &self,
-        fbank: &OnlineFbank,
-        start_frame: usize,
-        end_frame: usize,
-    ) -> Result<Tensor<2>> {
-        if end_frame <= start_frame {
-            return Ok(Tensor::<2>::zeros([0, INPUT_DIM], &self.device));
+    /// 对 fbank 特征做 `(feats - means) * inverse_std` 归一化。
+    fn apply_cmvn(&self, feats: Tensor<2>) -> Tensor<2> {
+        if feats.dims()[0] == 0 {
+            return Tensor::<2>::zeros([0, INPUT_DIM], &self.device);
         }
-        let mut out = Vec::with_capacity((end_frame - start_frame) * INPUT_DIM);
-        for frame_idx in start_frame..end_frame {
-            let frame = fbank
-                .get_frame(frame_idx as i32)
-                .ok_or_else(|| anyhow::anyhow!("missing FireRed fbank frame {frame_idx}"))?;
-            for (dim, value) in frame.iter().enumerate() {
-                out.push((*value - self.means[dim]) * self.inverse_std[dim]);
-            }
-        }
-        Ok(Tensor::<2>::from_data(
-            TensorData::new(out, [end_frame - start_frame, INPUT_DIM]),
-            &self.device,
-        ))
-    }
-
-    fn fbank_options() -> FbankOptions {
-        FbankOptions {
-            frame_opts: FrameExtractionOptions {
-                samp_freq: SAMPLE_RATE as f32,
-                dither: 0.0,
-                frame_shift_ms: FRAME_SHIFT_MS as f32,
-                frame_length_ms: FRAME_LENGTH_MS as f32,
-                snip_edges: true,
-                ..Default::default()
-            },
-            mel_opts: MelBanksOptions {
-                num_bins: INPUT_DIM as i32,
-                ..Default::default()
-            },
-            energy_floor: 0.0,
-            ..Default::default()
-        }
+        (feats - self.means.clone()) * self.inverse_std.clone()
     }
 }
 
 impl FireRedFeatureStream {
     fn push(&mut self, samples: &[f32]) -> Result<Tensor<2>> {
-        let waveform = samples
-            .iter()
-            .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
-            .collect::<Vec<_>>();
-        self.fbank.accept_waveform(SAMPLE_RATE as f32, &waveform);
-        self.collect_ready_frames()
+        let waveform = to_kaldi_scale(samples);
+        let frames = self.fbank.push(&waveform);
+        Ok(self.frontend.apply_cmvn(frames))
     }
 
     fn finish(&mut self) -> Result<Tensor<2>> {
-        self.fbank.input_finished();
-        self.collect_ready_frames()
-    }
-
-    fn collect_ready_frames(&mut self) -> Result<Tensor<2>> {
-        let frames = self.fbank.num_ready_frames() as usize;
-        let feats = self
-            .frontend
-            .collect_frames(&self.fbank, self.emitted_frames, frames)?;
-        self.emitted_frames = frames;
-        Ok(feats)
+        let frames = self.fbank.finish();
+        Ok(self.frontend.apply_cmvn(frames))
     }
 }
 

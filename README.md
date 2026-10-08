@@ -4,9 +4,10 @@
 Python 绑定、离线检测和流式检测。默认使用 Burn Flex CPU 后端，FSMN VAD 也支持
 Apple Metal 后端。支持 FSMN VAD 和 FireRedVAD 两种模型，二者共用同一套检测接口。
 
-- 纯 CPU 即可高速推理，离线场景可达 1600x 以上实时速度（FSMN Flex 超过 2000x，Metal 超过 2600x）。
+- 纯 CPU 即可高速推理，离线场景可达 1600x 以上实时速度（FSMN Flex 超过 2000x，Metal 接近 6000x）。
 - 同时支持离线整段检测和按 chunk 的流式检测。
 - Rust 与 Python 接口对齐，模型可在 FSMN VAD / FireRedVAD 之间直接替换。
+- 特征前端（fbank / LFR / CMVN）全部用 Burn 实现，无 C++ / CMake 依赖，特征可与推理共用同一后端。
 
 ## 安装
 
@@ -53,15 +54,16 @@ cargo run --release --features metal -p vad-burn --example bench_fsmn_vad -- \
 
 | 后端 | 模式 | 平均耗时 | RTF | 加速比 |
 | --- | --- | ---: | ---: | ---: |
-| Flex | 离线整段 | 32.814 ms | 0.000466 | 2147.58x |
-| Flex | 流式 600 ms chunk | 168.029 ms | 0.002384 | 419.40x |
-| Metal | 离线整段 | 26.291 ms | 0.000373 | 2680.45x |
-| Metal | 流式 600 ms chunk | 395.577 ms | 0.005613 | 178.15x |
+| Flex | 离线整段 | 33.803 ms | 0.000480 | 2084.76x |
+| Flex | 流式 600 ms chunk | 207.200 ms | 0.002940 | 340.11x |
+| Metal | 离线整段 | 11.928 ms | 0.000169 | 5908.02x |
+| Metal | 流式 600 ms chunk | 457.022 ms | 0.006485 | 154.20x |
 
-Metal 离线比 Flex 快约 25%，细分耗时显示 GPU 算子接近免费，瓶颈转移到结果回读
-（`output_tensor`）和 CPU 侧的 fbank（`frontend`）。Metal 流式每 600 ms 需同步一次
-GPU 与 CPU，固定开销摊不掉，单次实测波动较大（`min 191 ms / max 1488 ms`），上表数值
-仅供参考；短块流式建议用 Flex。
+离线路径下前端产出的是设备端张量，Metal 上无需把几十 MB 特征从 CPU 拷到 GPU，
+因此 Metal 离线从 28.6 ms 降到 11.9 ms。流式的 600 ms chunk 只有 58 帧，FFT 与
+matmul 的每次调用固定开销摊不掉，比 CPU 版参考实现慢约 20%，短块流式耗时仍远低于
+实时（Flex 340x）。Metal 流式每块都要同步一次 GPU，单次实测波动较大
+（`min 224 ms / max 1475 ms`），短块流式建议用 Flex。
 
 ### FireRedVAD
 
@@ -79,11 +81,29 @@ cargo run --release -p vad-burn --example bench_firered_vad -- \
 
 | 模式 | 平均耗时 | RTF | 加速比 |
 | --- | ---: | ---: | ---: |
-| 离线 VAD | 42.357 ms | 0.000601 | 1663.75x |
-| Stream-VAD 600 ms chunk | 113.187 ms | 0.001606 | 622.60x |
+| 离线 VAD | 43.951 ms | 0.000624 | 1603.41x |
+| Stream-VAD 600 ms chunk | 147.961 ms | 0.002100 | 476.28x |
 
 两个 benchmark example 都会同时打印离线与流式的平均/最小/最大耗时、RTF 和加速比，
 FSMN 还会输出 frontend / forward / segmenter 以及各算子的细分耗时，便于定位瓶颈。
+
+## 特征前端
+
+fbank / LFR / CMVN 全部用 Burn 算子实现，不再依赖 `kaldi-native-fbank` 的 C++ 代码：
+
+- 分帧用 `Tensor::unfold`，窗口数公式与 Kaldi `snip_edges=true` 完全一致。
+- 去直流、预加重、加窗、幂率谱、三角 Mel 滤波器组、对数压缩都按 Kaldi 语义逐步复刻。
+- FFT 使用 `burn-signal` 的 `rfft`（Flex 与 Metal 均有原生实现），正向不归一化，
+  只保留 `fft_size / 2` 个 bin，与 Kaldi 丢弃 Nyquist bin 的行为一致。
+- 流式路径只保留后续帧仍会用到的尾部样本，内存与帧长同阶。
+
+数值对齐由单测保证：对同一段伪随机波形与 `kaldi-fbank-rust-kautism` 逐帧对拍，
+Hamming 窗最大绝对误差 `6.6e-5`、Povey 窗 `3.6e-4`（对数域，RMS 约 `3e-6`）。
+该 crate 已降级为 `dev-dependency`，仅在测试中使用。
+
+```bash
+cargo test --lib fbank:: -- --nocapture
+```
 
 ## Rust 用法
 

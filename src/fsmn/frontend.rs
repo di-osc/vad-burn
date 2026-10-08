@@ -4,17 +4,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use burn::tensor::{Device, Int, Tensor, TensorData};
-use kaldi_fbank_rust_kautism::{
-    FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
-};
 
 use super::FeatureTensor;
+use crate::fbank::{FbankExtractor, FbankOptions, FbankStream, WindowType, to_kaldi_scale};
 
-/// 离线特征前端，持有 CMVN 参数。
+/// 离线特征前端，持有 Fbank 提取器与 CMVN 参数。
 #[derive(Debug, Clone)]
 pub struct FsmnVadFrontend {
     config: WavFrontendConfig,
     device: Device,
+    fbank: FbankExtractor,
     cmvn_means: Option<FeatureTensor>,
     cmvn_vars: Option<FeatureTensor>,
 }
@@ -25,8 +24,9 @@ pub struct FsmnVadFeatureStream {
     device: Device,
     cmvn_means: Option<FeatureTensor>,
     cmvn_vars: Option<FeatureTensor>,
-    fbank: OnlineFbank,
-    fbank_frames: Vec<Vec<f32>>,
+    fbank: FbankStream,
+    /// 目前累积的全部 fbank 帧，形状 `[rows, n_mels]`。
+    fbank_frames: FeatureTensor,
     emitted_lfr_frames: usize,
 }
 
@@ -49,11 +49,8 @@ impl FsmnVadFrontend {
 
     /// 从归一化到 `[-1, 1]` 的浮点 PCM 提取 LFR + CMVN 特征。
     pub fn extract_features_from_normalized_f32(&self, samples: &[f32]) -> Result<FeatureTensor> {
-        let waveform = samples
-            .iter()
-            .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
-            .collect::<Vec<_>>();
-        let fbank = self.compute_fbank_features(&waveform)?;
+        let waveform = to_kaldi_scale(samples);
+        let fbank = self.fbank.compute(&waveform);
         let lfr = self.apply_lfr(fbank);
         Ok(self.apply_cmvn(lfr))
     }
@@ -65,33 +62,10 @@ impl FsmnVadFrontend {
             device: self.device.clone(),
             cmvn_means: self.cmvn_means.clone(),
             cmvn_vars: self.cmvn_vars.clone(),
-            fbank: OnlineFbank::new(self.fbank_options()),
-            fbank_frames: Vec::new(),
+            fbank: FbankStream::new(&self.fbank),
+            fbank_frames: Tensor::<2>::zeros([0, self.config.n_mels], &self.device),
             emitted_lfr_frames: 0,
         }
-    }
-
-    /// 计算整段波形的 fbank 特征。
-    fn compute_fbank_features(&self, waveform: &[f32]) -> Result<FeatureTensor> {
-        let mut fbank = OnlineFbank::new(self.fbank_options());
-        fbank.accept_waveform(self.config.sample_rate as f32, waveform);
-        let frames = fbank.num_ready_frames() as usize;
-        let mut out = Vec::with_capacity(frames * self.config.n_mels);
-        for i in 0..frames as i32 {
-            let frame = fbank
-                .get_frame(i)
-                .ok_or_else(|| anyhow::anyhow!("missing fbank frame {i}"))?;
-            out.extend_from_slice(frame);
-        }
-        Ok(Tensor::<2>::from_data(
-            TensorData::new(out, [frames, self.config.n_mels]),
-            &self.device,
-        ))
-    }
-
-    /// 当前前端的 fbank 配置。
-    fn fbank_options(&self) -> FbankOptions {
-        fbank_options(&self.config)
     }
 
     /// 对 fbank 做 LFR（低帧率）拼接。
@@ -156,9 +130,11 @@ impl FsmnVadFrontend {
         } else {
             (None, None)
         };
+        let fbank = FbankExtractor::new(fbank_options(&config), device.clone())?;
         Ok(Self {
             config,
             device,
+            fbank,
             cmvn_means,
             cmvn_vars,
         })
@@ -168,56 +144,49 @@ impl FsmnVadFrontend {
 impl FsmnVadFeatureStream {
     /// 送入一块归一化浮点 PCM，返回本次新产生的 LFR + CMVN 特征。
     pub fn push_normalized_f32(&mut self, samples: &[f32]) -> Result<FeatureTensor> {
-        let waveform = samples
-            .iter()
-            .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
-            .collect::<Vec<_>>();
-        self.fbank
-            .accept_waveform(self.config.sample_rate as f32, &waveform);
-        self.collect_ready_fbank_frames()?;
+        let waveform = to_kaldi_scale(samples);
+        let new_frames = self.fbank.push(&waveform);
+        self.append_fbank_frames(new_frames);
         let lfr = self.next_lfr_frames(false);
         Ok(apply_cmvn(lfr, &self.cmvn_means, &self.cmvn_vars))
     }
 
     /// 冲刷会话，返回剩余特征。
     pub fn finish(&mut self) -> Result<FeatureTensor> {
-        self.fbank.input_finished();
-        self.collect_ready_fbank_frames()?;
+        let new_frames = self.fbank.finish();
+        self.append_fbank_frames(new_frames);
         let lfr = self.next_lfr_frames(true);
         Ok(apply_cmvn(lfr, &self.cmvn_means, &self.cmvn_vars))
     }
 
     /// 重置流式状态，便于复用到下一段音频。
     pub fn reset(&mut self) {
-        self.fbank = OnlineFbank::new(fbank_options(&self.config));
-        self.fbank_frames.clear();
+        self.fbank.reset();
+        self.fbank_frames = Tensor::<2>::zeros([0, self.config.n_mels], &self.device);
         self.emitted_lfr_frames = 0;
     }
 
-    /// 把 fbank 中已经就绪、但尚未收集的帧追加进缓存。
-    fn collect_ready_fbank_frames(&mut self) -> Result<()> {
-        let ready_frames = self.fbank.num_ready_frames() as usize;
-        for frame_idx in self.fbank_frames.len()..ready_frames {
-            let frame = self
-                .fbank
-                .get_frame(frame_idx as i32)
-                .ok_or_else(|| anyhow::anyhow!("missing fbank frame {frame_idx}"))?;
-            self.fbank_frames.push(frame.to_vec());
+    /// 把新产出的 fbank 帧追加进累积张量。
+    fn append_fbank_frames(&mut self, new_frames: FeatureTensor) {
+        if new_frames.dims()[0] == 0 {
+            return;
         }
-        Ok(())
+        self.fbank_frames = Tensor::cat(vec![self.fbank_frames.clone(), new_frames], 0);
     }
 
     /// 产出尚未发射的 LFR 帧；`is_final` 时使用末尾不足窗口的残余帧。
     fn next_lfr_frames(&mut self, is_final: bool) -> FeatureTensor {
-        let fbank_rows = self.fbank_frames.len();
+        let fbank_rows = self.fbank_frames.dims()[0];
         let n_mels = self.config.n_mels;
-        let feat_dim = n_mels * self.config.lfr_m;
+        let lfr_m = self.config.lfr_m;
+        let lfr_n = self.config.lfr_n;
+        let feat_dim = n_mels * lfr_m;
         if fbank_rows == 0 {
             return Tensor::<2>::zeros([0, feat_dim], &self.device);
         }
 
         let total_lfr_frames = if is_final {
-            fbank_rows.div_ceil(self.config.lfr_n)
+            fbank_rows.div_ceil(lfr_n)
         } else {
             self.complete_lfr_frame_count(fbank_rows)
         };
@@ -225,24 +194,37 @@ impl FsmnVadFeatureStream {
             return Tensor::<2>::zeros([0, feat_dim], &self.device);
         }
 
-        let left_padding_rows = (self.config.lfr_m - 1) / 2;
+        // 左侧补 (lfr_m - 1) / 2 行，复制第一帧即可。
+        let left_padding_rows = (lfr_m - 1) / 2;
         let padded_rows = fbank_rows + left_padding_rows;
-        let new_lfr_frames = total_lfr_frames - self.emitted_lfr_frames;
-        let mut out = Vec::with_capacity(new_lfr_frames * feat_dim);
+        let padded = if left_padding_rows == 0 {
+            self.fbank_frames.clone()
+        } else {
+            let left_pad = self
+                .fbank_frames
+                .clone()
+                .slice([0..1, 0..n_mels])
+                .repeat_dim(0, left_padding_rows);
+            Tensor::cat(vec![left_pad, self.fbank_frames.clone()], 0)
+        };
 
-        for row in self.emitted_lfr_frames..total_lfr_frames {
-            for m in 0..self.config.lfr_m {
-                let padded_idx = (row * self.config.lfr_n + m).min(padded_rows - 1);
-                let fbank_idx = padded_idx.saturating_sub(left_padding_rows);
-                out.extend_from_slice(&self.fbank_frames[fbank_idx]);
+        // 与离线路径相同的 gather 逻辑，只是只取尚未发射的行。
+        let new_lfr_frames = total_lfr_frames - self.emitted_lfr_frames;
+        let mut parts = Vec::with_capacity(lfr_m);
+        for m in 0..lfr_m {
+            let mut indices = Vec::with_capacity(new_lfr_frames);
+            for row in self.emitted_lfr_frames..total_lfr_frames {
+                indices.push(((row * lfr_n + m).min(padded_rows - 1)) as i32);
             }
+            let indices = Tensor::<1, Int>::from_data(
+                TensorData::new(indices, [new_lfr_frames]).convert::<i32>(),
+                &self.device,
+            );
+            parts.push(padded.clone().select(0, indices));
         }
         self.emitted_lfr_frames = total_lfr_frames;
 
-        Tensor::<2>::from_data(
-            TensorData::new(out, [new_lfr_frames, feat_dim]),
-            &self.device,
-        )
+        Tensor::cat(parts, 1)
     }
 
     /// 在不看未来帧的前提下，当前能完整产出的 LFR 帧数。
@@ -270,24 +252,19 @@ fn apply_cmvn(
     (feats + means.clone()) * vars.clone()
 }
 
-/// 根据前端配置生成 kaldi fbank 参数。
+/// 根据前端配置生成 Kaldi 兼容的 Fbank 参数。
 fn fbank_options(config: &WavFrontendConfig) -> FbankOptions {
     FbankOptions {
-        frame_opts: FrameExtractionOptions {
-            samp_freq: config.sample_rate as f32,
-            window_type: c"hamming".as_ptr(),
-            dither: 0.0,
-            frame_shift_ms: config.frame_shift_ms,
-            frame_length_ms: config.frame_length_ms,
-            snip_edges: true,
-            ..Default::default()
-        },
-        mel_opts: MelBanksOptions {
-            num_bins: config.n_mels as i32,
-            ..Default::default()
-        },
-        energy_floor: 0.0,
-        ..Default::default()
+        sample_rate: config.sample_rate as u32,
+        frame_length_ms: config.frame_length_ms,
+        frame_shift_ms: config.frame_shift_ms,
+        num_mel_bins: config.n_mels,
+        low_freq: 20.0,
+        high_freq: 0.0,
+        preemph_coeff: 0.97,
+        remove_dc_offset: true,
+        window_type: WindowType::Hamming,
+        round_to_power_of_two: true,
     }
 }
 

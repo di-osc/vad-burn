@@ -1,3 +1,4 @@
+mod fbank;
 pub mod firered;
 pub mod fsmn;
 #[cfg(feature = "python")]
