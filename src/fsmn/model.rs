@@ -4,10 +4,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use burn::prelude::Backend as BurnBackend;
-use burn::tensor::Tensor;
+use burn::tensor::{Device, Tensor};
 
-use super::constants::{Backend, FEAT_DIM, SAMPLE_RATE};
+use super::constants::{FEAT_DIM, SAMPLE_RATE};
 use super::frontend::{FsmnVadFeatureStream, FsmnVadFrontend};
 use super::post::{FsmnVadPostProcessor, FsmnVadStreamingPostProcessor};
 use super::timing::{FsmnForwardTiming, FsmnVadTiming};
@@ -17,7 +16,7 @@ use crate::{
     prepare_stream_16k,
 };
 
-pub type FeatureTensor<B = Backend> = Tensor<B, 2>;
+pub type FeatureTensor = Tensor<2>;
 
 pub const DEFAULT_MODELSCOPE_REPO_ID: &str = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch";
 pub const DEFAULT_MODELSCOPE_REVISION: &str = "master";
@@ -29,26 +28,26 @@ pub struct FsmnVadDetection {
     pub timing: FsmnVadTiming,
 }
 
-pub struct FsmnVadModel<B: BurnBackend = Backend> {
-    frontend: FsmnVadFrontend<B>,
+pub struct FsmnVadModel {
+    frontend: FsmnVadFrontend,
     post_processor: FsmnVadPostProcessor,
-    weights: Arc<BurnFsmnWeights<B>>,
+    weights: Arc<BurnFsmnWeights>,
     model_dir: PathBuf,
 }
 
 /// 有状态的流式 FSMN VAD 会话，持有特征缓存和在线切段状态。
-pub struct FsmnVadSession<B: BurnBackend = Backend> {
-    frontend: FsmnVadFrontend<B>,
-    weights: Arc<BurnFsmnWeights<B>>,
+pub struct FsmnVadSession {
+    frontend: FsmnVadFrontend,
+    weights: Arc<BurnFsmnWeights>,
     options: VadOptions,
-    channels: HashMap<AudioChannel, FsmnVadChannel<B>>,
+    channels: HashMap<AudioChannel, FsmnVadChannel>,
     resamplers: HashMap<AudioChannel, asr_data::StreamingResampler>,
 }
 
 /// 单个声道的流式 FSMN 推理状态。
-struct FsmnVadChannel<B: BurnBackend> {
-    feature_stream: FsmnVadFeatureStream<B>,
-    caches: Vec<Tensor<B, 2>>,
+struct FsmnVadChannel {
+    feature_stream: FsmnVadFeatureStream,
+    caches: Vec<Tensor<2>>,
     post_processor: FsmnVadStreamingPostProcessor,
     samples: Vec<f32>,
     pending_samples: Vec<f32>,
@@ -58,15 +57,12 @@ struct FsmnVadChannel<B: BurnBackend> {
 
 impl FsmnVadModel {
     pub fn from_pretrained(model_dir: impl AsRef<Path>) -> Result<Self> {
-        Self::from_pretrained_on_device(model_dir, Default::default())
+        Self::from_pretrained_on_device(model_dir, Device::flex())
     }
 }
 
-impl<B: BurnBackend> FsmnVadModel<B> {
-    pub fn from_pretrained_on_device(
-        model_dir: impl AsRef<Path>,
-        device: B::Device,
-    ) -> Result<Self> {
+impl FsmnVadModel {
+    pub fn from_pretrained_on_device(model_dir: impl AsRef<Path>, device: Device) -> Result<Self> {
         let model_dir = model_dir.as_ref().to_path_buf();
         let frontend = FsmnVadFrontend::new_on_device(&model_dir, device.clone())?;
         let weights = BurnFsmnWeights::load(&model_dir, device)?;
@@ -104,19 +100,19 @@ impl FsmnVadModel {
     }
 }
 
-impl<B: BurnBackend> FsmnVadModel<B> {
+impl FsmnVadModel {
     pub fn model_dir(&self) -> &Path {
         &self.model_dir
     }
 
-    pub fn forward_frame_scores(&self, feats: FeatureTensor<B>) -> Result<Vec<Vec<f32>>> {
+    pub fn forward_frame_scores(&self, feats: FeatureTensor) -> Result<Vec<Vec<f32>>> {
         let mut caches = self.weights.zero_caches();
         self.weights.forward_frame_scores(feats, &mut caches)
     }
 
     pub fn forward_frame_scores_with_timing(
         &self,
-        feats: FeatureTensor<B>,
+        feats: FeatureTensor,
     ) -> Result<(Vec<Vec<f32>>, FsmnForwardTiming)> {
         let mut caches = self.weights.zero_caches();
         let mut timing = FsmnForwardTiming::default();
@@ -129,7 +125,7 @@ impl<B: BurnBackend> FsmnVadModel<B> {
     /// 创建有状态的流式推理会话。
     ///
     /// 每个音频流对应一个会话；不要在同一会话上并发调用 `push` / `finish`。
-    pub fn new_session(&self, options: VadOptions) -> FsmnVadSession<B> {
+    pub fn new_session(&self, options: VadOptions) -> FsmnVadSession {
         FsmnVadSession {
             frontend: self.frontend.clone(),
             weights: Arc::clone(&self.weights),
@@ -240,7 +236,7 @@ fn modelscope_snapshot_dir(cache_dir: &Path, repo_id: &str, revision: &str) -> P
         .join(revision)
 }
 
-impl<B: BurnBackend> FsmnVadSession<B> {
+impl FsmnVadSession {
     /// 标注已经从 `stream` 拉下来的一块音频，并把新产生的 activity 写进 timeline。
     ///
     /// 每个声道使用独立推理状态。源采样率不是 16 kHz 时在内部做有状态重采样。
@@ -318,7 +314,7 @@ impl<B: BurnBackend> FsmnVadSession<B> {
         self.resamplers.clear();
     }
 
-    fn channel_mut(&mut self, channel: AudioChannel) -> &mut FsmnVadChannel<B> {
+    fn channel_mut(&mut self, channel: AudioChannel) -> &mut FsmnVadChannel {
         if !self.channels.contains_key(&channel) {
             let inner = FsmnVadChannel::new(&self.frontend, &self.weights, &self.options);
             self.channels.insert(channel, inner);
@@ -350,12 +346,8 @@ impl<B: BurnBackend> FsmnVadSession<B> {
     }
 }
 
-impl<B: BurnBackend> FsmnVadChannel<B> {
-    fn new(
-        frontend: &FsmnVadFrontend<B>,
-        weights: &BurnFsmnWeights<B>,
-        options: &VadOptions,
-    ) -> Self {
+impl FsmnVadChannel {
+    fn new(frontend: &FsmnVadFrontend, weights: &BurnFsmnWeights, options: &VadOptions) -> Self {
         Self {
             feature_stream: frontend.new_stream(),
             caches: weights.zero_caches(),
@@ -369,7 +361,7 @@ impl<B: BurnBackend> FsmnVadChannel<B> {
 
     fn push(
         &mut self,
-        weights: &BurnFsmnWeights<B>,
+        weights: &BurnFsmnWeights,
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<Vec<TimeSpan>> {
@@ -388,7 +380,7 @@ impl<B: BurnBackend> FsmnVadChannel<B> {
         Ok(segments)
     }
 
-    fn finish(&mut self, weights: &BurnFsmnWeights<B>) -> Result<Vec<TimeSpan>> {
+    fn finish(&mut self, weights: &BurnFsmnWeights) -> Result<Vec<TimeSpan>> {
         let final_frame_scores = self.next_final_frame_scores(weights)?;
         let mut segments = if self.pending_frame_scores.is_empty() {
             Vec::new()
@@ -410,7 +402,7 @@ impl<B: BurnBackend> FsmnVadChannel<B> {
 
     fn next_frame_scores(
         &mut self,
-        weights: &BurnFsmnWeights<B>,
+        weights: &BurnFsmnWeights,
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<Vec<Vec<f32>>> {
@@ -432,7 +424,7 @@ impl<B: BurnBackend> FsmnVadChannel<B> {
         Ok(frame_scores)
     }
 
-    fn next_final_frame_scores(&mut self, weights: &BurnFsmnWeights<B>) -> Result<Vec<Vec<f32>>> {
+    fn next_final_frame_scores(&mut self, weights: &BurnFsmnWeights) -> Result<Vec<Vec<f32>>> {
         let feats = self.feature_stream.finish()?;
         let [frames, feat_dim] = feats.dims();
         if feat_dim != FEAT_DIM {
@@ -472,7 +464,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn burn_metal_detects_fixture() -> Result<()> {
-        use burn::backend::{Metal, wgpu::WgpuDevice};
+        use burn::tensor::{Device, DeviceKind};
 
         let Some(model_dir) = default_model_path() else {
             eprintln!("skipping: FSMN VAD model not found");
@@ -485,8 +477,10 @@ mod tests {
         }
         let waveform = Waveform::from_path(&audio)?.slice_ms(0, 12_000);
         let options = VadOptions::default();
-        let burn =
-            FsmnVadModel::<Metal>::from_pretrained_on_device(model_dir, WgpuDevice::default())?;
+        let burn = FsmnVadModel::from_pretrained_on_device(
+            model_dir,
+            Device::metal(DeviceKind::DefaultDevice),
+        )?;
 
         let detection = burn.detect_with_timing(&waveform, &options)?;
         assert!(!detection.frame_scores.is_empty());

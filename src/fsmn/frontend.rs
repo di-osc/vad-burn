@@ -1,34 +1,38 @@
+//! FSMN VAD 特征前端：fbank -> LFR -> CMVN，支持离线与流式。
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use burn::prelude::Backend as BurnBackend;
-use burn::tensor::{Int, Tensor, TensorData};
+use burn::tensor::{Device, Int, Tensor, TensorData};
 use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
 
 use super::FeatureTensor;
 
+/// 离线特征前端，持有 CMVN 参数。
 #[derive(Debug, Clone)]
-pub struct FsmnVadFrontend<B: BurnBackend> {
+pub struct FsmnVadFrontend {
     config: WavFrontendConfig,
-    device: B::Device,
-    cmvn_means: Option<FeatureTensor<B>>,
-    cmvn_vars: Option<FeatureTensor<B>>,
+    device: Device,
+    cmvn_means: Option<FeatureTensor>,
+    cmvn_vars: Option<FeatureTensor>,
 }
 
-pub struct FsmnVadFeatureStream<B: BurnBackend> {
+/// 流式特征前端，按块累积 fbank 帧并增量产出 LFR 特征。
+pub struct FsmnVadFeatureStream {
     config: WavFrontendConfig,
-    device: B::Device,
-    cmvn_means: Option<FeatureTensor<B>>,
-    cmvn_vars: Option<FeatureTensor<B>>,
+    device: Device,
+    cmvn_means: Option<FeatureTensor>,
+    cmvn_vars: Option<FeatureTensor>,
     fbank: OnlineFbank,
     fbank_frames: Vec<Vec<f32>>,
     emitted_lfr_frames: usize,
 }
 
-impl<B: BurnBackend> FsmnVadFrontend<B> {
-    pub fn new_on_device(model_dir: impl AsRef<Path>, device: B::Device) -> Result<Self> {
+impl FsmnVadFrontend {
+    /// 在指定设备上从模型目录构造前端。
+    pub fn new_on_device(model_dir: impl AsRef<Path>, device: Device) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         validate_model_dir(model_dir)?;
         Self::from_config(
@@ -43,10 +47,8 @@ impl<B: BurnBackend> FsmnVadFrontend<B> {
         )
     }
 
-    pub fn extract_features_from_normalized_f32(
-        &self,
-        samples: &[f32],
-    ) -> Result<FeatureTensor<B>> {
+    /// 从归一化到 `[-1, 1]` 的浮点 PCM 提取 LFR + CMVN 特征。
+    pub fn extract_features_from_normalized_f32(&self, samples: &[f32]) -> Result<FeatureTensor> {
         let waveform = samples
             .iter()
             .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
@@ -56,7 +58,8 @@ impl<B: BurnBackend> FsmnVadFrontend<B> {
         Ok(self.apply_cmvn(lfr))
     }
 
-    pub fn new_stream(&self) -> FsmnVadFeatureStream<B> {
+    /// 基于当前前端配置创建一个流式特征会话。
+    pub fn new_stream(&self) -> FsmnVadFeatureStream {
         FsmnVadFeatureStream {
             config: self.config.clone(),
             device: self.device.clone(),
@@ -68,7 +71,8 @@ impl<B: BurnBackend> FsmnVadFrontend<B> {
         }
     }
 
-    fn compute_fbank_features(&self, waveform: &[f32]) -> Result<FeatureTensor<B>> {
+    /// 计算整段波形的 fbank 特征。
+    fn compute_fbank_features(&self, waveform: &[f32]) -> Result<FeatureTensor> {
         let mut fbank = OnlineFbank::new(self.fbank_options());
         fbank.accept_waveform(self.config.sample_rate as f32, waveform);
         let frames = fbank.num_ready_frames() as usize;
@@ -79,25 +83,28 @@ impl<B: BurnBackend> FsmnVadFrontend<B> {
                 .ok_or_else(|| anyhow::anyhow!("missing fbank frame {i}"))?;
             out.extend_from_slice(frame);
         }
-        Ok(Tensor::<B, 2>::from_data(
+        Ok(Tensor::<2>::from_data(
             TensorData::new(out, [frames, self.config.n_mels]),
             &self.device,
         ))
     }
 
+    /// 当前前端的 fbank 配置。
     fn fbank_options(&self) -> FbankOptions {
         fbank_options(&self.config)
     }
 
-    fn apply_lfr(&self, fbank: FeatureTensor<B>) -> FeatureTensor<B> {
+    /// 对 fbank 做 LFR（低帧率）拼接。
+    fn apply_lfr(&self, fbank: FeatureTensor) -> FeatureTensor {
         let [t, _] = fbank.dims();
         let n_mels = self.config.n_mels;
         let feat_dim = n_mels * self.config.lfr_m;
         if t == 0 {
-            return Tensor::<B, 2>::zeros([0, feat_dim], &self.device);
+            return Tensor::<2>::zeros([0, feat_dim], &self.device);
         }
 
         let t_lfr = t.div_ceil(self.config.lfr_n);
+        // LFR 左侧需要补 (lfr_m - 1) / 2 行。
         let left_padding_rows = (self.config.lfr_m - 1) / 2;
         let padded = if left_padding_rows == 0 {
             fbank
@@ -110,13 +117,14 @@ impl<B: BurnBackend> FsmnVadFrontend<B> {
         };
         let padded_rows = t + left_padding_rows;
 
+        // 每一帧拼接 lfr_m 个相邻 fbank 帧，通过 gather 索引实现。
         let mut parts = Vec::with_capacity(self.config.lfr_m);
         for m in 0..self.config.lfr_m {
             let mut indices = Vec::with_capacity(t_lfr);
             for row in 0..t_lfr {
                 indices.push(((row * self.config.lfr_n + m).min(padded_rows - 1)) as i32);
             }
-            let indices = Tensor::<B, 1, Int>::from_data(
+            let indices = Tensor::<1, Int>::from_data(
                 TensorData::new(indices, [t_lfr]).convert::<i32>(),
                 &self.device,
             );
@@ -125,13 +133,41 @@ impl<B: BurnBackend> FsmnVadFrontend<B> {
         Tensor::cat(parts, 1)
     }
 
-    fn apply_cmvn(&self, feats: FeatureTensor<B>) -> FeatureTensor<B> {
+    /// 应用 CMVN 归一化。
+    fn apply_cmvn(&self, feats: FeatureTensor) -> FeatureTensor {
         apply_cmvn(feats, &self.cmvn_means, &self.cmvn_vars)
+    }
+
+    /// 加载 CMVN 参数并构造前端。
+    fn from_config(config: WavFrontendConfig, device: Device) -> Result<Self> {
+        let (cmvn_means, cmvn_vars) = if let Some(cmvn_path) = &config.cmvn_file {
+            let (means, vars) = load_cmvn(cmvn_path)?;
+            let dim = means.len();
+            (
+                Some(Tensor::<2>::from_data(
+                    TensorData::new(means, [1, dim]),
+                    &device,
+                )),
+                Some(Tensor::<2>::from_data(
+                    TensorData::new(vars, [1, dim]),
+                    &device,
+                )),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            config,
+            device,
+            cmvn_means,
+            cmvn_vars,
+        })
     }
 }
 
-impl<B: BurnBackend> FsmnVadFeatureStream<B> {
-    pub fn push_normalized_f32(&mut self, samples: &[f32]) -> Result<FeatureTensor<B>> {
+impl FsmnVadFeatureStream {
+    /// 送入一块归一化浮点 PCM，返回本次新产生的 LFR + CMVN 特征。
+    pub fn push_normalized_f32(&mut self, samples: &[f32]) -> Result<FeatureTensor> {
         let waveform = samples
             .iter()
             .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
@@ -143,19 +179,22 @@ impl<B: BurnBackend> FsmnVadFeatureStream<B> {
         Ok(apply_cmvn(lfr, &self.cmvn_means, &self.cmvn_vars))
     }
 
-    pub fn finish(&mut self) -> Result<FeatureTensor<B>> {
+    /// 冲刷会话，返回剩余特征。
+    pub fn finish(&mut self) -> Result<FeatureTensor> {
         self.fbank.input_finished();
         self.collect_ready_fbank_frames()?;
         let lfr = self.next_lfr_frames(true);
         Ok(apply_cmvn(lfr, &self.cmvn_means, &self.cmvn_vars))
     }
 
+    /// 重置流式状态，便于复用到下一段音频。
     pub fn reset(&mut self) {
         self.fbank = OnlineFbank::new(fbank_options(&self.config));
         self.fbank_frames.clear();
         self.emitted_lfr_frames = 0;
     }
 
+    /// 把 fbank 中已经就绪、但尚未收集的帧追加进缓存。
     fn collect_ready_fbank_frames(&mut self) -> Result<()> {
         let ready_frames = self.fbank.num_ready_frames() as usize;
         for frame_idx in self.fbank_frames.len()..ready_frames {
@@ -168,12 +207,13 @@ impl<B: BurnBackend> FsmnVadFeatureStream<B> {
         Ok(())
     }
 
-    fn next_lfr_frames(&mut self, is_final: bool) -> FeatureTensor<B> {
+    /// 产出尚未发射的 LFR 帧；`is_final` 时使用末尾不足窗口的残余帧。
+    fn next_lfr_frames(&mut self, is_final: bool) -> FeatureTensor {
         let fbank_rows = self.fbank_frames.len();
         let n_mels = self.config.n_mels;
         let feat_dim = n_mels * self.config.lfr_m;
         if fbank_rows == 0 {
-            return Tensor::<B, 2>::zeros([0, feat_dim], &self.device);
+            return Tensor::<2>::zeros([0, feat_dim], &self.device);
         }
 
         let total_lfr_frames = if is_final {
@@ -182,7 +222,7 @@ impl<B: BurnBackend> FsmnVadFeatureStream<B> {
             self.complete_lfr_frame_count(fbank_rows)
         };
         if total_lfr_frames <= self.emitted_lfr_frames {
-            return Tensor::<B, 2>::zeros([0, feat_dim], &self.device);
+            return Tensor::<2>::zeros([0, feat_dim], &self.device);
         }
 
         let left_padding_rows = (self.config.lfr_m - 1) / 2;
@@ -199,12 +239,13 @@ impl<B: BurnBackend> FsmnVadFeatureStream<B> {
         }
         self.emitted_lfr_frames = total_lfr_frames;
 
-        Tensor::<B, 2>::from_data(
+        Tensor::<2>::from_data(
             TensorData::new(out, [new_lfr_frames, feat_dim]),
             &self.device,
         )
     }
 
+    /// 在不看未来帧的前提下，当前能完整产出的 LFR 帧数。
     fn complete_lfr_frame_count(&self, fbank_rows: usize) -> usize {
         let left_padding_rows = (self.config.lfr_m - 1) / 2;
         if fbank_rows <= left_padding_rows {
@@ -214,11 +255,12 @@ impl<B: BurnBackend> FsmnVadFeatureStream<B> {
     }
 }
 
-fn apply_cmvn<B: BurnBackend>(
-    feats: FeatureTensor<B>,
-    cmvn_means: &Option<FeatureTensor<B>>,
-    cmvn_vars: &Option<FeatureTensor<B>>,
-) -> FeatureTensor<B> {
+/// 应用 CMVN：`(feats + means) * vars`，维度不匹配时原样返回。
+fn apply_cmvn(
+    feats: FeatureTensor,
+    cmvn_means: &Option<FeatureTensor>,
+    cmvn_vars: &Option<FeatureTensor>,
+) -> FeatureTensor {
     let (Some(means), Some(vars)) = (cmvn_means, cmvn_vars) else {
         return feats;
     };
@@ -228,6 +270,7 @@ fn apply_cmvn<B: BurnBackend>(
     (feats + means.clone()) * vars.clone()
 }
 
+/// 根据前端配置生成 kaldi fbank 参数。
 fn fbank_options(config: &WavFrontendConfig) -> FbankOptions {
     FbankOptions {
         frame_opts: FrameExtractionOptions {
@@ -270,33 +313,6 @@ impl Default for WavFrontendConfig {
             lfr_n: 6,
             cmvn_file: None,
         }
-    }
-}
-
-impl<B: BurnBackend> FsmnVadFrontend<B> {
-    fn from_config(config: WavFrontendConfig, device: B::Device) -> Result<Self> {
-        let (cmvn_means, cmvn_vars) = if let Some(cmvn_path) = &config.cmvn_file {
-            let (means, vars) = load_cmvn(cmvn_path)?;
-            let dim = means.len();
-            (
-                Some(Tensor::<B, 2>::from_data(
-                    TensorData::new(means, [1, dim]),
-                    &device,
-                )),
-                Some(Tensor::<B, 2>::from_data(
-                    TensorData::new(vars, [1, dim]),
-                    &device,
-                )),
-            )
-        } else {
-            (None, None)
-        };
-        Ok(Self {
-            config,
-            device,
-            cmvn_means,
-            cmvn_vars,
-        })
     }
 }
 

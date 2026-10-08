@@ -1,14 +1,15 @@
+//! FSMN VAD 权重加载与前向推理。
+
 use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use burn::module::Param;
 use burn::nn::Linear;
-use burn::prelude::Backend as BurnBackend;
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::{Device, Tensor, TensorData};
 use burn_store::pytorch::PytorchReader;
 
-use super::constants::{Backend, CACHE_FRAMES, FEAT_DIM, LAYERS, PROJ_DIM};
+use super::constants::{CACHE_FRAMES, FEAT_DIM, LAYERS, PROJ_DIM};
 use super::model::FeatureTensor;
 use super::ops::{
     fsmn_memory, load_conv_left_weight, load_vec, next_cache, silence_posterior, snapshot_shape,
@@ -16,27 +17,31 @@ use super::ops::{
 };
 use super::timing::FsmnForwardTiming;
 
-pub struct BurnFsmnWeights<B: BurnBackend = Backend> {
-    device: B::Device,
-    in_linear1: BurnLinear<B>,
-    in_linear2: BurnLinear<B>,
-    blocks: Vec<BurnFsmnBlock<B>>,
-    out_linear1: BurnLinear<B>,
-    out_linear2: BurnLinear<B>,
+/// 一组 FSMN VAD 权重，包含输入/输出线性层和 4 个 FSMN block。
+pub struct BurnFsmnWeights {
+    device: Device,
+    in_linear1: BurnLinear,
+    in_linear2: BurnLinear,
+    blocks: Vec<BurnFsmnBlock>,
+    out_linear1: BurnLinear,
+    out_linear2: BurnLinear,
 }
 
-struct BurnFsmnBlock<B: BurnBackend = Backend> {
-    linear: BurnLinear<B>,
-    affine: BurnLinear<B>,
-    conv_left_weight: Tensor<B, 3>,
+/// 单个 FSMN block：线性投影、memory 卷积和仿射层。
+struct BurnFsmnBlock {
+    linear: BurnLinear,
+    affine: BurnLinear,
+    conv_left_weight: Tensor<3>,
 }
 
-struct BurnLinear<B: BurnBackend = Backend> {
-    inner: Linear<B>,
+/// 带可选 ReLU 的线性层封装。
+struct BurnLinear {
+    inner: Linear,
 }
 
-impl<B: BurnBackend> BurnFsmnWeights<B> {
-    pub fn load(model_dir: &Path, device: B::Device) -> Result<Self> {
+impl BurnFsmnWeights {
+    /// 从模型目录加载权重到指定设备。
+    pub fn load(model_dir: &Path, device: Device) -> Result<Self> {
         let model_path = model_dir.join("model.pt");
         let reader = PytorchReader::new(&model_path)
             .with_context(|| format!("failed to load {}", model_path.display()))?;
@@ -72,32 +77,36 @@ impl<B: BurnBackend> BurnFsmnWeights<B> {
         })
     }
 
-    pub fn zero_caches(&self) -> Vec<Tensor<B, 2>> {
+    /// 为每个 FSMN block 创建全零初始缓存。
+    pub fn zero_caches(&self) -> Vec<Tensor<2>> {
         (0..LAYERS)
-            .map(|_| Tensor::<B, 2>::zeros([CACHE_FRAMES, PROJ_DIM], &self.device))
+            .map(|_| Tensor::<2>::zeros([CACHE_FRAMES, PROJ_DIM], &self.device))
             .collect()
     }
 
+    /// 离线推理：一次前向得到所有帧的静音后验。
     pub fn forward_frame_scores(
         &self,
-        feats: FeatureTensor<B>,
-        caches: &mut [Tensor<B, 2>],
+        feats: FeatureTensor,
+        caches: &mut [Tensor<2>],
     ) -> Result<Vec<Vec<f32>>> {
         self.forward_frame_scores_inner(feats, caches, false)
     }
 
+    /// 流式推理：前向的同时更新 FSMN 缓存。
     pub fn forward_frame_scores_streaming(
         &self,
-        feats: FeatureTensor<B>,
-        caches: &mut [Tensor<B, 2>],
+        feats: FeatureTensor,
+        caches: &mut [Tensor<2>],
     ) -> Result<Vec<Vec<f32>>> {
         self.forward_frame_scores_inner(feats, caches, true)
     }
 
+    /// 前向主体，`update_caches` 控制是否滚动缓存。
     fn forward_frame_scores_inner(
         &self,
-        feats: FeatureTensor<B>,
-        caches: &mut [Tensor<B, 2>],
+        feats: FeatureTensor,
+        caches: &mut [Tensor<2>],
         update_caches: bool,
     ) -> Result<Vec<Vec<f32>>> {
         let [frames, feat_dim] = feats.dims();
@@ -120,10 +129,11 @@ impl<B: BurnBackend> BurnFsmnWeights<B> {
         tensor_rows(silence_posterior(x, frames)?, frames, 1)
     }
 
+    /// 带逐算子计时信息的前向推理。
     pub fn forward_frame_scores_with_timing(
         &self,
-        feats: FeatureTensor<B>,
-        caches: &mut [Tensor<B, 2>],
+        feats: FeatureTensor,
+        caches: &mut [Tensor<2>],
         timing: &mut FsmnForwardTiming,
     ) -> Result<Vec<Vec<f32>>> {
         let [frames, feat_dim] = feats.dims();
@@ -168,14 +178,15 @@ impl<B: BurnBackend> BurnFsmnWeights<B> {
     }
 }
 
-impl<B: BurnBackend> BurnFsmnBlock<B> {
+impl BurnFsmnBlock {
+    /// 单个 block 的前向：线性投影 -> FSMN memory -> 仿射层。
     fn forward(
         &self,
-        input: Tensor<B, 2>,
+        input: Tensor<2>,
         frames: usize,
-        cache: &mut Tensor<B, 2>,
+        cache: &mut Tensor<2>,
         update_cache: bool,
-    ) -> Result<Tensor<B, 2>> {
+    ) -> Result<Tensor<2>> {
         let projected = self.linear.forward(input, false);
         let memory = fsmn_memory(
             projected.clone(),
@@ -189,15 +200,16 @@ impl<B: BurnBackend> BurnFsmnBlock<B> {
         Ok(self.affine.forward(memory, true))
     }
 
+    /// 与 [`Self::forward`] 相同，但记录各子步骤耗时。
     fn forward_with_timing(
         &self,
-        input: Tensor<B, 2>,
+        input: Tensor<2>,
         frames: usize,
-        cache: &Tensor<B, 2>,
+        cache: &Tensor<2>,
         idx: usize,
         timing: &mut FsmnForwardTiming,
         update_cache: bool,
-    ) -> Result<Tensor<B, 2>> {
+    ) -> Result<Tensor<2>> {
         let start = Instant::now();
         let projected = self.linear.forward(input, false);
         timing.block_linear_seconds[idx] += start.elapsed().as_secs_f64();
@@ -219,13 +231,9 @@ impl<B: BurnBackend> BurnFsmnBlock<B> {
     }
 }
 
-impl<B: BurnBackend> BurnLinear<B> {
-    fn load(
-        reader: &PytorchReader,
-        device: &B::Device,
-        prefix: &str,
-        has_bias: bool,
-    ) -> Result<Self> {
+impl BurnLinear {
+    /// 从 checkpoint 读取权重（并按需转置）构造线性层。
+    fn load(reader: &PytorchReader, device: &Device, prefix: &str, has_bias: bool) -> Result<Self> {
         let weight_key = format!("{prefix}.weight");
         let weight_shape = snapshot_shape(reader, &weight_key)?;
         if weight_shape.len() != 2 {
@@ -234,6 +242,7 @@ impl<B: BurnBackend> BurnLinear<B> {
         let out_dim = weight_shape[0];
         let in_dim = weight_shape[1];
         let weight = load_vec(reader, &weight_key)?;
+        // checkpoint 里是 [out, in]，换成交叉行优先的 [in, out]。
         let mut weight_t = vec![0.0; weight.len()];
         for out_idx in 0..out_dim {
             for in_idx in 0..in_dim {
@@ -248,12 +257,12 @@ impl<B: BurnBackend> BurnLinear<B> {
         };
         Ok(Self {
             inner: Linear {
-                weight: Param::from_tensor(Tensor::<B, 2>::from_data(
+                weight: Param::from_tensor(Tensor::<2>::from_data(
                     TensorData::new(weight_t, [in_dim, out_dim]),
                     device,
                 )),
                 bias: bias_vec.map(|bias| {
-                    Param::from_tensor(Tensor::<B, 1>::from_data(
+                    Param::from_tensor(Tensor::<1>::from_data(
                         TensorData::new(bias, [out_dim]),
                         device,
                     ))
@@ -262,7 +271,8 @@ impl<B: BurnBackend> BurnLinear<B> {
         })
     }
 
-    fn forward(&self, input: Tensor<B, 2>, relu: bool) -> Tensor<B, 2> {
+    /// 线性前向，`relu` 为真时在输出后接 ReLU。
+    fn forward(&self, input: Tensor<2>, relu: bool) -> Tensor<2> {
         let mut out = self.inner.forward(input);
         if relu {
             out = burn::tensor::activation::relu(out);

@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use burn::backend::flex::FlexDevice;
 use burn::tensor::module::conv1d;
 use burn::tensor::ops::ConvOptions;
-use burn::tensor::{DType, Tensor, TensorData};
+use burn::tensor::{Device, Tensor, TensorData};
 use burn_store::pytorch::PytorchReader;
+use burn_store::pytorch_reader::DType;
 use kaldi_fbank_rust_kautism::{
     FbankOptions, FrameExtractionOptions, MelBanksOptions, OnlineFbank,
 };
@@ -18,8 +18,6 @@ use crate::{
     Audio, AudioChannel, AudioChunk, AudioStream, FIRERED_VAD_SOURCE, TimeSpan, VadOptions,
     Waveform, annotate_audio, prepare_stream_16k, speech_span,
 };
-
-type Backend = burn::backend::Flex;
 
 const SAMPLE_RATE: u32 = 16_000;
 const FRAME_SHIFT_MS: u64 = 10;
@@ -396,21 +394,21 @@ struct FireRedDfsmnBlock {
 }
 
 struct FireRedFsmn {
-    lookback_tensor: Tensor<Backend, 3>,
-    memory_tensor: Option<Tensor<Backend, 3>>,
+    lookback_tensor: Tensor<3>,
+    memory_tensor: Option<Tensor<3>>,
     lookback_weight: Vec<f32>,
 }
 
 struct BurnLinear {
-    weight_t: Tensor<Backend, 2>,
-    bias: Option<Tensor<Backend, 1>>,
+    weight_t: Tensor<2>,
+    bias: Option<Tensor<1>>,
     in_dim: usize,
     out_dim: usize,
 }
 
 impl FireRedVadWeights {
     fn load(model_dir: &Path) -> Result<Self> {
-        let device = FlexDevice;
+        let device = Device::flex();
         let frontend = FireRedFrontend::new(&model_dir.join("cmvn.ark"))?;
         let reader =
             PytorchReader::with_top_level_key(model_dir.join("model.pth.tar"), "model_state_dict")
@@ -453,7 +451,7 @@ impl FireRedVadWeights {
         })
     }
 
-    fn forward_probs(&self, feats: Tensor<Backend, 2>) -> Result<Vec<f32>> {
+    fn forward_probs(&self, feats: Tensor<2>) -> Result<Vec<f32>> {
         let [frames, dim] = feats.dims();
         if dim != INPUT_DIM {
             bail!("FireRedVAD expects feature dim {INPUT_DIM}, got {dim}");
@@ -470,7 +468,7 @@ impl FireRedVadWeights {
         let data = probs
             .into_data()
             .convert::<f32>()
-            .into_vec::<f32>()
+            .try_into_vec::<f32>()
             .expect("FireRedVAD output tensor data");
         if data.len() != frames {
             bail!(
@@ -483,7 +481,7 @@ impl FireRedVadWeights {
 
     fn forward_probs_streaming(
         &self,
-        feats: Tensor<Backend, 2>,
+        feats: Tensor<2>,
         caches: &mut [Vec<f32>],
     ) -> Result<Vec<f32>> {
         if caches.len() != self.fsmn_count() {
@@ -512,7 +510,7 @@ impl FireRedVadWeights {
         let data = probs
             .into_data()
             .convert::<f32>()
-            .into_vec::<f32>()
+            .try_into_vec::<f32>()
             .expect("FireRedVAD streaming output tensor data");
         if data.len() != frames {
             bail!(
@@ -535,18 +533,14 @@ impl FireRedVadWeights {
 }
 
 impl FireRedDfsmnBlock {
-    fn forward(&self, input: Tensor<Backend, 2>) -> Result<Tensor<Backend, 2>> {
+    fn forward(&self, input: Tensor<2>) -> Result<Tensor<2>> {
         let residual = input.clone();
         let mut x = self.fc1.forward(input, true)?;
         x = self.fc2.forward(x, false)?;
         Ok(self.fsmn.forward(x)? + residual)
     }
 
-    fn forward_streaming(
-        &self,
-        input: Tensor<Backend, 2>,
-        cache: &mut Vec<f32>,
-    ) -> Result<Tensor<Backend, 2>> {
+    fn forward_streaming(&self, input: Tensor<2>, cache: &mut Vec<f32>) -> Result<Tensor<2>> {
         let residual = input.clone();
         let mut x = self.fc1.forward(input, true)?;
         x = self.fc2.forward(x, false)?;
@@ -555,7 +549,7 @@ impl FireRedDfsmnBlock {
 }
 
 impl FireRedFsmn {
-    fn load(reader: &PytorchReader, device: &FlexDevice, prefix: &str) -> Result<Self> {
+    fn load(reader: &PytorchReader, device: &Device, prefix: &str) -> Result<Self> {
         let lookback_key = format!("{prefix}.lookback_filter.weight");
         let lookahead_key = format!("{prefix}.lookahead_filter.weight");
         let lookback_raw = load_fsmn_raw(reader, &lookback_key)?;
@@ -574,7 +568,7 @@ impl FireRedFsmn {
         })
     }
 
-    fn forward(&self, input: Tensor<Backend, 2>) -> Result<Tensor<Backend, 2>> {
+    fn forward(&self, input: Tensor<2>) -> Result<Tensor<2>> {
         let [frames, proj_dim] = input.dims();
         if proj_dim != PROJ_DIM {
             bail!("unexpected FireRed FSMN input shape: {:?}", input.dims());
@@ -608,11 +602,7 @@ impl FireRedFsmn {
         Ok(input + lookback)
     }
 
-    fn forward_streaming(
-        &self,
-        input: Tensor<Backend, 2>,
-        cache: &mut Vec<f32>,
-    ) -> Result<Tensor<Backend, 2>> {
+    fn forward_streaming(&self, input: Tensor<2>, cache: &mut Vec<f32>) -> Result<Tensor<2>> {
         let [frames, proj_dim] = input.dims();
         if proj_dim != PROJ_DIM {
             bail!(
@@ -628,7 +618,8 @@ impl FireRedFsmn {
                 cache_frames * PROJ_DIM
             );
         }
-        let input_data = input.into_data().convert::<f32>().into_vec::<f32>()?;
+        let device = input.device();
+        let input_data = input.into_data().convert::<f32>().try_into_vec::<f32>()?;
         let mut output = input_data.clone();
         apply_fsmn_streaming_lookback(
             &input_data,
@@ -638,9 +629,9 @@ impl FireRedFsmn {
             &self.lookback_weight,
         );
         update_fsmn_cache(&input_data, frames, cache);
-        Ok(Tensor::<Backend, 2>::from_data(
+        Ok(Tensor::<2>::from_data(
             TensorData::new(output, [frames, PROJ_DIM]),
-            &FlexDevice,
+            &device,
         ))
     }
 }
@@ -693,12 +684,7 @@ fn update_fsmn_cache(input: &[f32], frames: usize, cache: &mut Vec<f32>) {
 }
 
 impl BurnLinear {
-    fn load(
-        reader: &PytorchReader,
-        device: &FlexDevice,
-        prefix: &str,
-        has_bias: bool,
-    ) -> Result<Self> {
+    fn load(reader: &PytorchReader, device: &Device, prefix: &str, has_bias: bool) -> Result<Self> {
         let weight_key = format!("{prefix}.weight");
         let weight_shape = tensor_shape(reader, &weight_key)?;
         if weight_shape.len() != 2 {
@@ -715,7 +701,7 @@ impl BurnLinear {
         }
         let bias = if has_bias {
             let bias = load_vec(reader, &format!("{prefix}.bias"))?;
-            Some(Tensor::<Backend, 1>::from_data(
+            Some(Tensor::<1>::from_data(
                 TensorData::new(bias, [out_dim]),
                 device,
             ))
@@ -723,17 +709,14 @@ impl BurnLinear {
             None
         };
         Ok(Self {
-            weight_t: Tensor::<Backend, 2>::from_data(
-                TensorData::new(weight_t, [in_dim, out_dim]),
-                device,
-            ),
+            weight_t: Tensor::<2>::from_data(TensorData::new(weight_t, [in_dim, out_dim]), device),
             bias,
             in_dim,
             out_dim,
         })
     }
 
-    fn forward(&self, input: Tensor<Backend, 2>, relu: bool) -> Result<Tensor<Backend, 2>> {
+    fn forward(&self, input: Tensor<2>, relu: bool) -> Result<Tensor<2>> {
         let [rows, in_dim] = input.dims();
         if in_dim != self.in_dim {
             bail!(
@@ -764,7 +747,7 @@ impl BurnLinear {
 struct FireRedFrontend {
     means: Vec<f32>,
     inverse_std: Vec<f32>,
-    device: FlexDevice,
+    device: Device,
 }
 
 struct FireRedFeatureStream {
@@ -786,11 +769,11 @@ impl FireRedFrontend {
         Ok(Self {
             means,
             inverse_std,
-            device: FlexDevice,
+            device: Device::flex(),
         })
     }
 
-    fn extract(&self, samples: &[f32]) -> Result<Tensor<Backend, 2>> {
+    fn extract(&self, samples: &[f32]) -> Result<Tensor<2>> {
         let waveform = samples
             .iter()
             .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
@@ -814,9 +797,9 @@ impl FireRedFrontend {
         fbank: &OnlineFbank,
         start_frame: usize,
         end_frame: usize,
-    ) -> Result<Tensor<Backend, 2>> {
+    ) -> Result<Tensor<2>> {
         if end_frame <= start_frame {
-            return Ok(Tensor::<Backend, 2>::zeros([0, INPUT_DIM], &self.device));
+            return Ok(Tensor::<2>::zeros([0, INPUT_DIM], &self.device));
         }
         let mut out = Vec::with_capacity((end_frame - start_frame) * INPUT_DIM);
         for frame_idx in start_frame..end_frame {
@@ -827,7 +810,7 @@ impl FireRedFrontend {
                 out.push((*value - self.means[dim]) * self.inverse_std[dim]);
             }
         }
-        Ok(Tensor::<Backend, 2>::from_data(
+        Ok(Tensor::<2>::from_data(
             TensorData::new(out, [end_frame - start_frame, INPUT_DIM]),
             &self.device,
         ))
@@ -854,7 +837,7 @@ impl FireRedFrontend {
 }
 
 impl FireRedFeatureStream {
-    fn push(&mut self, samples: &[f32]) -> Result<Tensor<Backend, 2>> {
+    fn push(&mut self, samples: &[f32]) -> Result<Tensor<2>> {
         let waveform = samples
             .iter()
             .map(|sample| sample.clamp(-1.0, 1.0) * 32768.0)
@@ -863,12 +846,12 @@ impl FireRedFeatureStream {
         self.collect_ready_frames()
     }
 
-    fn finish(&mut self) -> Result<Tensor<Backend, 2>> {
+    fn finish(&mut self) -> Result<Tensor<2>> {
         self.fbank.input_finished();
         self.collect_ready_frames()
     }
 
-    fn collect_ready_frames(&mut self) -> Result<Tensor<Backend, 2>> {
+    fn collect_ready_frames(&mut self) -> Result<Tensor<2>> {
         let frames = self.fbank.num_ready_frames() as usize;
         let feats = self
             .frontend
@@ -1367,8 +1350,7 @@ fn tensor_shape(reader: &PytorchReader, key: &str) -> Result<Vec<usize>> {
     Ok(reader
         .get(key)
         .ok_or_else(|| anyhow::anyhow!("missing tensor {key}"))?
-        .shape
-        .as_ref()
+        .shape()
         .to_vec())
 }
 
@@ -1376,10 +1358,19 @@ fn load_vec(reader: &PytorchReader, key: &str) -> Result<Vec<f32>> {
     let snapshot = reader
         .get(key)
         .ok_or_else(|| anyhow::anyhow!("missing tensor {key}"))?;
-    if snapshot.dtype != DType::F32 {
-        bail!("{key} must be F32, got {:?}", snapshot.dtype);
+    if snapshot.dtype() != DType::F32 {
+        bail!("{key} must be F32, got {:?}", snapshot.dtype());
     }
-    Ok(snapshot.to_data()?.convert::<f32>().into_vec::<f32>()?)
+    // pytorch-reader 返回 native-endian 的连续 f32 字节。
+    let bytes = snapshot
+        .read()
+        .with_context(|| format!("failed to read tensor {key}"))?;
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_ne_bytes(*chunk))
+        .collect())
 }
 
 fn load_fsmn_raw(reader: &PytorchReader, key: &str) -> Result<Vec<f32>> {
@@ -1390,15 +1381,11 @@ fn load_fsmn_raw(reader: &PytorchReader, key: &str) -> Result<Vec<f32>> {
     load_vec(reader, key)
 }
 
-fn fsmn_tensor(raw: Vec<f32>, device: &FlexDevice) -> Tensor<Backend, 3> {
-    Tensor::<Backend, 3>::from_data(TensorData::new(raw, [PROJ_DIM, 1, FSMN_ORDER]), device)
+fn fsmn_tensor(raw: Vec<f32>, device: &Device) -> Tensor<3> {
+    Tensor::<3>::from_data(TensorData::new(raw, [PROJ_DIM, 1, FSMN_ORDER]), device)
 }
 
-fn combined_fsmn_tensor(
-    lookback: &[f32],
-    lookahead: &[f32],
-    device: &FlexDevice,
-) -> Tensor<Backend, 3> {
+fn combined_fsmn_tensor(lookback: &[f32], lookahead: &[f32], device: &Device) -> Tensor<3> {
     let mut combined = vec![0.0; PROJ_DIM * FSMN_ORDER * 2];
     for channel in 0..PROJ_DIM {
         let lookback_base = channel * FSMN_ORDER;
@@ -1409,7 +1396,7 @@ fn combined_fsmn_tensor(
         combined[combined_base + FSMN_ORDER..combined_base + FSMN_ORDER * 2]
             .copy_from_slice(&lookahead[lookback_base..lookback_base + FSMN_ORDER]);
     }
-    Tensor::<Backend, 3>::from_data(
+    Tensor::<3>::from_data(
         TensorData::new(combined, [PROJ_DIM, 1, FSMN_ORDER * 2]),
         device,
     )

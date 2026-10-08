@@ -1,5 +1,3 @@
-pub type Backend = burn::backend::Flex;
-
 pub const LAYERS: usize = 4;
 pub const PROJ_DIM: usize = 128;
 pub const CACHE_FRAMES: usize = 19;

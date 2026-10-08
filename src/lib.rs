@@ -7,6 +7,8 @@ mod types;
 pub use asr_data::{
     Audio, AudioActivity, AudioChannel, AudioChunk, AudioStream, TimeRange, TimeSpan, Waveform,
 };
+// 重新导出推理设备类型，方便调用方为 `from_pretrained_on_device` 选择后端。
+pub use burn::tensor::{Device, DeviceKind};
 pub use firered::{
     DEFAULT_FIRERED_MODELSCOPE_REPO_ID, DEFAULT_FIRERED_MODELSCOPE_REVISION, FireRedVadDetection,
     FireRedVadModel, FireRedVadSession, FireRedVadTiming,

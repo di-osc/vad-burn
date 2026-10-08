@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use burn::prelude::Backend as BurnBackend;
 use vad_burn::{FsmnForwardTiming, FsmnVadModel, TimeSpan, VadOptions, Waveform};
 
 fn main() -> Result<()> {
@@ -30,14 +29,17 @@ fn load_flex_model(args: &Args) -> Result<FsmnVadModel> {
 
 #[cfg(feature = "metal")]
 fn run_metal_benchmark(args: &Args, waveform: &Waveform, options: &VadOptions) -> Result<()> {
-    use burn::backend::{Metal, wgpu::WgpuDevice};
+    use burn::tensor::{Device, DeviceKind};
 
     let model_dir = args
         .model
         .clone()
         .or_else(default_model_path)
         .ok_or_else(|| anyhow::anyhow!("FSMN VAD model not found; pass --model MODEL_DIR"))?;
-    let burn = FsmnVadModel::<Metal>::from_pretrained_on_device(model_dir, WgpuDevice::default())?;
+    let burn = FsmnVadModel::from_pretrained_on_device(
+        model_dir,
+        Device::metal(DeviceKind::DefaultDevice),
+    )?;
     run_benchmark(args, waveform, options, burn)
 }
 
@@ -46,11 +48,11 @@ fn run_metal_benchmark(_args: &Args, _waveform: &Waveform, _options: &VadOptions
     bail!("--backend metal requires building with --features metal")
 }
 
-fn run_benchmark<B: BurnBackend>(
+fn run_benchmark(
     args: &Args,
     waveform: &Waveform,
     options: &VadOptions,
-    burn: FsmnVadModel<B>,
+    burn: FsmnVadModel,
 ) -> Result<()> {
     for _ in 0..args.warmup {
         let _ = burn.detect(&waveform, &options)?;
@@ -169,8 +171,8 @@ fn spans_content_eq(left: &[TimeSpan], right: &[TimeSpan]) -> bool {
     left.len() == right.len() && left.iter().zip(right).all(|(a, b)| a.content_eq(b))
 }
 
-fn detect_streaming<B: BurnBackend>(
-    model: &FsmnVadModel<B>,
+fn detect_streaming(
+    model: &FsmnVadModel,
     waveform: &Waveform,
     options: &VadOptions,
     chunk_ms: u64,
